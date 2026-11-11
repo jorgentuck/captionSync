@@ -10,3 +10,6 @@
 /dist/
 
 .DS_Store
+
+# Claude Code local state (worktrees etc.)
+/.claude/
