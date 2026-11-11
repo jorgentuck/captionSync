@@ -26,11 +26,11 @@ type Service struct {
 	proc  *Processor
 
 	paused     atomic.Bool
-	engineDown atomic.Int64  // unix nanos until which workers back off (engine unavailable)
-	lastOK     atomic.Int64  // unix nanos of the last job the engine got through
-	lastOKID   atomic.Int64  // ...and which file that was
-	engFails   map[int64]int // consecutive engine failures per file (guarded by mu)
-	recent     []jobStat     // last finished jobs, for throughput/ETA (guarded by mu)
+	engineDown atomic.Int64    // unix nanos until which workers back off (engine unavailable)
+	lastOK     atomic.Int64    // unix nanos of the last job the engine got through
+	lastOKID   atomic.Int64    // ...and which file that was
+	engFailAt  map[int64]int64 // when each file last failed the engine (guarded by mu)
+	recent     []jobStat       // last finished jobs, for throughput/ETA (guarded by mu)
 	wg         sync.WaitGroup
 
 	mu      sync.Mutex
@@ -59,7 +59,7 @@ type Scan struct {
 }
 
 func NewService(cfg *config.Config, st *store.Store, lib *library.Library, proc *Processor) *Service {
-	return &Service{cfg: cfg, store: st, lib: lib, proc: proc, current: map[int]*Current{}, engFails: map[int64]int{}}
+	return &Service{cfg: cfg, store: st, lib: lib, proc: proc, current: map[int]*Current{}, engFailAt: map[int64]int64{}}
 }
 
 // Run starts the workers; returns immediately.
@@ -67,6 +67,7 @@ func (s *Service) Run(ctx context.Context) {
 	if n, err := s.store.ResetProcessing(); err == nil && n > 0 {
 		slog.Info("re-queued interrupted files", "count", n)
 	}
+	go s.sweep(ctx)
 	for i := 0; i < s.cfg.Workers; i++ {
 		s.wg.Add(1)
 		go func(i int) {
@@ -168,7 +169,7 @@ func (s *Service) handle(ctx context.Context, wid int, f *store.File) {
 	}
 	s.record(cur.Started, out)
 	s.mu.Lock()
-	delete(s.engFails, f.ID)
+	delete(s.engFailAt, f.ID)
 	s.mu.Unlock()
 	var err error
 	for i := 0; i < 3; i++ {
@@ -179,7 +180,9 @@ func (s *Service) handle(ctx context.Context, wid int, f *store.File) {
 	}
 	if err != nil {
 		slog.Error("could not save result; re-queuing", "path", f.Path, "err", err)
-		_ = s.store.Requeue(f.ID, "result could not be saved: "+err.Error(), true, time.Minute)
+		if err := s.store.Requeue(f.ID, "result could not be saved: "+err.Error(), true, time.Minute); err != nil {
+			slog.Error("requeue after failed save also failed; the sweeper will retry", "path", f.Path, "err", err)
+		}
 		return
 	}
 	slog.Info("done", "path", f.Path, "status", out.Status, "msg", out.Message,
@@ -195,12 +198,15 @@ func (s *Service) requeue(f *store.File, out Outcome) {
 	countAttempt, delay := false, s.cfg.Settle
 	if out.EngineDown {
 		delay = 0
-		recentOther := time.Since(time.Unix(0, s.lastOK.Load())) < 30*time.Minute && s.lastOKID.Load() != f.ID
+		// Blame the file only with evidence: the engine served a DIFFERENT file successfully after
+		// this file's previous engine failure. Otherwise (first failure, or nothing has worked
+		// since) treat it as an outage: pause the workers and don't count it.
+		now := time.Now().UnixNano()
 		s.mu.Lock()
-		s.engFails[f.ID]++
-		repeated := s.engFails[f.ID] >= 3 // the same file keeps failing it, even with nothing else to compare
+		prev, seen := s.engFailAt[f.ID]
+		s.engFailAt[f.ID] = now
 		s.mu.Unlock()
-		if recentOther || repeated {
+		if seen && s.lastOK.Load() > prev && s.lastOKID.Load() != f.ID {
 			countAttempt = true
 		} else {
 			s.engineDown.Store(time.Now().Add(time.Minute).UnixNano())
@@ -211,6 +217,37 @@ func (s *Service) requeue(f *store.File, out Outcome) {
 		slog.Error("requeue", "err", err)
 	}
 	slog.Info("requeued", "path", f.Path, "why", out.Message, "counted", countAttempt)
+}
+
+// sweep re-queues rows stuck in 'processing' with no worker on them (e.g. a result that could not
+// be saved while /config was full), so they don't stay unprocessable until a restart.
+func (s *Service) sweep(ctx context.Context) {
+	t := time.NewTicker(2 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		ids, err := s.store.ProcessingIDs()
+		if err != nil {
+			continue
+		}
+		s.mu.Lock()
+		active := map[int64]bool{}
+		for _, c := range s.current {
+			active[c.ID] = true
+		}
+		s.mu.Unlock()
+		for _, id := range ids {
+			if !active[id] {
+				if err := s.store.Requeue(id, "found stuck in processing; retrying", false, 0); err != nil {
+					slog.Error("sweep requeue", "id", id, "err", err)
+				}
+			}
+		}
+	}
 }
 
 type jobStat struct {

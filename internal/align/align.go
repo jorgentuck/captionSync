@@ -211,6 +211,9 @@ type Result struct {
 	MedianShiftMs int64    `json:"median_shift_ms"`
 	MaxShiftMs    int64    `json:"max_shift_ms"`
 	WantsFull     bool     `json:"-"`
+	// SampleDisagrees: part of the sampled audio contradicted the result (not just thin evidence) -
+	// such a result must not stand as "in sync" without a full pass.
+	SampleDisagrees bool `json:"-"`
 }
 
 // ---------------------------------------------------------------------------
@@ -871,9 +874,11 @@ func CorrelateOffset(cues []Cue, speech, spans [][2]float64, duration, maxOffset
 	for k := -K; k <= K; k++ { // sum_t a[t] * b[t-k]  ->  delta = k*res
 		var s float64
 		for _, t := range active {
+			bj := float32(-1) // before/after the film: no subtitle on screen (skipping it biased the peak)
 			if j := t - k; j >= 0 && j < n {
-				s += float64(a[t] * b[j])
+				bj = b[j]
 			}
+			s += float64(a[t] * bj)
 		}
 		vals[k+K] = s
 	}
@@ -918,37 +923,43 @@ func CorrelateOffset(cues []Cue, speech, spans [][2]float64, duration, maxOffset
 		Method: "activity", Confidence: math.Round(math.Min(1, sharp/3)*1000) / 1000}
 }
 
-// halves runs the activity correlation separately on the first and second half of the film.
-// ok reports whether a half had enough subtitles to judge.
-func halves(cues []Cue, speech, spans [][2]float64, duration, maxOffset float64) (*Mapping, *Mapping, bool, bool) {
-	mid := duration / 2
-	part := func(lo, hi float64) (*Mapping, bool) {
+// activityAgrees runs the activity correlation separately on six parts of the film. Each part with
+// enough subtitles must find a clear peak within 0.5 s of the global offset - otherwise the film's
+// timing isn't one global shift (a jump, drift) and the global answer can't be trusted.
+func activityAgrees(cues []Cue, speech, spans [][2]float64, duration, maxOffset, global float64) bool {
+	const parts = 6
+	for i := 0; i < parts; i++ {
+		lo, hi := duration*float64(i)/parts, duration*float64(i+1)/parts
+		if i == parts-1 {
+			hi = math.Inf(1)
+		}
 		var c []Cue
 		for _, x := range cues {
 			if x.Start >= lo && x.Start < hi {
 				c = append(c, x)
 			}
 		}
+		if len(c) < 20 {
+			continue
+		}
 		var sp, sn [][2]float64
 		for _, x := range speech {
-			if x[0] >= lo && x[0] < hi {
+			if x[0] >= lo-maxOffset && x[0] < hi+maxOffset {
 				sp = append(sp, x)
 			}
 		}
 		for _, w := range spans {
-			a, b := math.Max(w[0], lo), math.Min(w[1], hi)
+			a, b := math.Max(w[0], lo-maxOffset), math.Min(w[1], hi+maxOffset)
 			if b > a {
 				sn = append(sn, [2]float64{a, b})
 			}
 		}
-		if len(c) < 20 {
-			return nil, false
+		m := CorrelateOffset(c, sp, sn, duration, maxOffset)
+		if m == nil || math.Abs(m.Pieces[0].Offset-global) > 0.5 {
+			return false
 		}
-		return CorrelateOffset(c, sp, sn, duration, maxOffset), true
 	}
-	a, okA := part(0, mid)
-	b, okB := part(mid, math.Inf(1))
-	return a, b, okA, okB
+	return true
 }
 
 func abs(x int) int {
@@ -1019,13 +1030,17 @@ func needsRatioSearch(m *Mapping) bool {
 }
 
 // cleanSample: a result from sampled windows is only trusted when the evidence is simple and
-// consistent - one offset, no drift, little disagreement - and every part of the film that was
-// heard backs it: a window with speech must not hold only disagreeing matches, and no two windows
-// with speech in a row may lack an agreeing match. Windows without speech (music, credits) don't
-// count against it. Anything else gets a full pass.
-func cleanSample(m *Mapping, words []Word, spans [][2]float64, tol float64) bool {
-	if len(m.Pieces) != 1 || m.Pieces[0].Slope != 0 || m.Confidence < 0.75 || m.Contradicted || len(m.agree) == 0 {
-		return false
+// consistent - one offset, no drift, little disagreement - and the parts of the film that were
+// heard back it: no window with speech whose plausible matches mostly disagree, and no run of 3+
+// windows with speech (about a quarter of the film) without an agreeing match. Windows without
+// speech (music, credits) don't count. disagrees reports actual contradicting evidence (as opposed
+// to merely thin evidence).
+func cleanSample(m *Mapping, words []Word, spans [][2]float64, tol float64) (clean, disagrees bool) {
+	if m.Contradicted {
+		return false, true
+	}
+	if len(m.Pieces) != 1 || m.Pieces[0].Slope != 0 || m.Confidence < 0.75 || len(m.agree) == 0 {
+		return false, false
 	}
 	missed := 0
 	for _, w := range spans {
@@ -1044,18 +1059,18 @@ func cleanSample(m *Mapping, words []Word, spans [][2]float64, tol float64) bool
 				agree++
 			}
 		}
+		if dis := m.disagreeIn(w); dis >= 2 && dis > agree {
+			return false, true // this part of the film contradicts the result
+		}
 		if agree > 0 {
 			missed = 0
 			continue
 		}
-		if m.disagreeIn(w) > 0 {
-			return false // only contradicting evidence from this part of the film
-		}
-		if missed++; missed >= 2 {
-			return false
+		if missed++; missed >= 3 {
+			return false, false
 		}
 	}
-	return true
+	return true, false
 }
 
 // minConfidentAnchors is the least evidence we act on, whatever MIN_ANCHORS says.
@@ -1112,17 +1127,19 @@ func Analyze(cues []Cue, words []Word, speech, spans [][2]float64, duration floa
 			r.Message += " (framerate " + strconv.FormatFloat(m.Scale, 'f', 4, 64) + "x)"
 		}
 		// sampled windows can miss a jump, a tail or a cold open: only a clean result stands
-		r.WantsFull = sampled && !cleanSample(m, words, spans, p.SplitTolerance)
+		if sampled {
+			clean, dis := cleanSample(m, words, spans, p.SplitTolerance)
+			r.WantsFull, r.SampleDisagrees = !clean, dis
+		}
 		return r
 	}
 	if p.AllowActivity {
 		if m := CorrelateOffset(cues, speech, spans, duration, p.MaxOffset); m != nil {
-			// one global offset only: refuse when the two halves of the film disagree
-			if a, b, okA, okB := halves(cues, speech, spans, duration, p.MaxOffset); (okA && a == nil) || (okB && b == nil) ||
-				(a != nil && b != nil && math.Abs(a.Pieces[0].Offset-b.Pieces[0].Offset) > 0.5) {
+			// one global offset only: refuse unless every part of the film agrees with it
+			if !activityAgrees(cues, speech, spans, duration, p.MaxOffset, m.Pieces[0].Offset) {
 				r.Status, r.Reason = "uncertain", "activity_ambiguous"
 				r.Message = "Subtitle text did not match the speech, and speech activity suggests different " +
-					"offsets in each half of the film; left unchanged"
+					"offsets in different parts of the film; left unchanged"
 				r.WantsFull = sampled
 				return r
 			}

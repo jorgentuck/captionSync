@@ -35,16 +35,34 @@ func (l *Library) MapPath(p string) string {
 	return m[1] + p[len(m[0]):]
 }
 
-// SharedStem reports whether another video in the same folder has the same name (Movie.mkv and
-// Movie.mp4): their subtitle files can't be attributed to one of them safely.
-func (l *Library) SharedStem(video string) bool {
-	entries, err := os.ReadDir(filepath.Dir(video))
-	if err != nil {
-		return false
-	}
+// sameStem lists other videos in the folder with the same name (Movie.mkv + Movie.mp4).
+func (l *Library) sameStem(video string, entries []os.DirEntry) []string {
 	me, st := filepath.Base(video), stem(filepath.Base(video))
+	var out []string
 	for _, e := range entries {
 		if !e.IsDir() && e.Name() != me && l.IsVideo(e.Name()) && stem(e.Name()) == st {
+			out = append(out, e.Name())
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// SharedStem reports whether another video in the same folder has the same name AND there are
+// subtitle files for that name: those can't be attributed to one of the videos safely.
+func (l *Library) SharedStem(video string) bool {
+	entries, err := os.ReadDir(filepath.Dir(video))
+	if err != nil || len(l.sameStem(video, entries)) == 0 {
+		return false
+	}
+	st := stem(filepath.Base(video))
+	by := l.videosByStem(entries)
+	stems := make([]string, 0, len(by))
+	for s := range by {
+		stems = append(stems, s)
+	}
+	for _, e := range entries {
+		if !e.IsDir() && l.IsSubtitle(e.Name()) && owner(e.Name(), stems) == st {
 			return true
 		}
 	}
@@ -221,6 +239,12 @@ func (l *Library) Signature(video string) string {
 	for _, s := range l.Sidecars(video) {
 		if ss, err := os.Stat(s); err == nil {
 			fmt.Fprintf(h, "|%s|%d|%d", filepath.Base(s), ss.Size(), ss.ModTime().UnixNano())
+		}
+	}
+	// a same-named video appearing or disappearing changes what this video's subtitles belong to
+	if entries, err := os.ReadDir(filepath.Dir(video)); err == nil {
+		for _, n := range l.sameStem(video, entries) {
+			fmt.Fprintf(h, "|twin:%s", n)
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil))[:20]

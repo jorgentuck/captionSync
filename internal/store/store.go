@@ -139,7 +139,7 @@ func migrate(db *sql.DB) error {
 	}
 	if ver < 2 {
 		// v2: 'attempts' now counts consecutive unfinished claims; older versions counted every run
-		if _, err := db.Exec(`UPDATE files SET attempts=0 WHERE status != 'processing'`); err != nil {
+		if _, err := db.Exec(`UPDATE files SET attempts=0`); err != nil {
 			return err
 		}
 		if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
@@ -513,4 +513,22 @@ func (s *Store) UncertainReasons() map[string]int {
 		}
 	}
 	return out
+}
+
+// ProcessingIDs lists files currently marked as being processed.
+func (s *Store) ProcessingIDs() ([]int64, error) {
+	rows, err := s.db.Query(`SELECT id FROM files WHERE status=?`, Processing)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }

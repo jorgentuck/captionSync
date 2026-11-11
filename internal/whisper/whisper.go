@@ -151,7 +151,12 @@ func (v *verboseJSON) chunk() *Chunk {
 		}
 		// The segment start is the only timestamp we use; inner words are spread evenly. If the
 		// segment opens with a non-speech tag ("(laughs) Okay"), its start is the laugh, not the word.
-		leadsWithWord := strings.HasPrefix(strings.TrimLeft(s.Text, " \t\"'-"), strings.TrimLeft(toks[0], "\"'-"))
+		// ...but punctuation (">>", "...", a dash) before the first word is just text, not a sound.
+		lead := s.Text
+		if i := strings.Index(s.Text, toks[0]); i >= 0 {
+			lead = s.Text[:i]
+		}
+		leadsWithWord := !nonSpeech.MatchString(lead)
 		step := (s.End - s.Start) / float64(len(toks))
 		for i, t := range toks {
 			st := s.Start + float64(i)*step

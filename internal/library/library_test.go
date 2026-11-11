@@ -57,3 +57,23 @@ func TestSymlinkCannotEscapeRoot(t *testing.T) {
 		t.Fatal("prefix confusion: /media2 accepted for /media")
 	}
 }
+
+func TestSharedStemOnlyWithSharedSubtitles(t *testing.T) {
+	d := t.TempDir()
+	touch(t, filepath.Join(d, "Film.mkv"))
+	touch(t, filepath.Join(d, "Film.mp4"))
+	l := lib(t, d)
+	if l.SharedStem(filepath.Join(d, "Film.mkv")) {
+		t.Fatal("no subtitle files: nothing ambiguous, embedded tracks must still be checked")
+	}
+	before := l.Signature(filepath.Join(d, "Film.mkv"))
+	touch(t, filepath.Join(d, "Film.en.srt"))
+	if !l.SharedStem(filepath.Join(d, "Film.mkv")) {
+		t.Fatal("shared subtitle not detected")
+	}
+	withTwin := l.Signature(filepath.Join(d, "Film.mkv"))
+	os.Remove(filepath.Join(d, "Film.mp4"))
+	if l.Signature(filepath.Join(d, "Film.mkv")) == withTwin || before == withTwin {
+		t.Fatal("signature must change when the duplicate video goes away, so the file is re-checked")
+	}
+}

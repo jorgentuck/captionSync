@@ -119,3 +119,29 @@ func TestRefineLoneSFXFarAway(t *testing.T) {
 		t.Fatalf("took %.3f (SFX at 9.0)", got)
 	}
 }
+
+// round 3: 0.3-0.6 s bursts before the line, and a 0.5 s+ SFX in a long silence
+func TestRefineIgnoresLongerBursts(t *testing.T) {
+	for _, burst := range []float64{0.3, 0.4, 0.5} {
+		d := New(synth(0.02, [][2]float64{{2.0, 2.0 + burst}, {3.5, 6.0}}, 9))
+		if got, ok := d.Refine(1.5, 7); ok && math.Abs(got-3.5) > 0.06 {
+			t.Fatalf("burst %.1f: took %.3f", burst, got)
+		}
+	}
+	for _, sfx := range []float64{0.4, 0.5} { // longer effects can't be told from a short spoken word + pause
+		d := New(synth(0.02, [][2]float64{{1.0, 2.0}, {9.0, 9.0 + sfx}, {14.0, 16.0}}, 18))
+		if got, ok := d.Refine(2.0, 17); ok && math.Abs(got-14.0) > 0.06 {
+			t.Fatalf("sfx %.1f: took %.3f", sfx, got)
+		}
+	}
+}
+
+// round 3: start ~0.3 s inside the previous line's end still finds the next onset
+func TestRefineStartNearPreviousLineEnd(t *testing.T) {
+	d := New(synth(0.02, [][2]float64{{2.0, 4.5}, {7.3, 9.5}}, 12))
+	for _, st := range []float64{4.1, 4.2} {
+		if got, ok := d.Refine(st, 11); !ok || math.Abs(got-7.3) > 0.06 {
+			t.Fatalf("t=%.1f: got %.3f ok=%v", st, got, ok)
+		}
+	}
+}

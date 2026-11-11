@@ -1,6 +1,7 @@
 package align
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"sort"
@@ -336,5 +337,48 @@ func TestReviewLongExcursionIsNotWritten(t *testing.T) {
 		sort.Slice(cues, func(i, j int) bool { return cues[i].Start < cues[j].Start })
 		r := Analyze(cues, words, nil, [][2]float64{{0, dur}}, dur, DefaultParams(), false)
 		checkRegion(t, "long excursion", sc, r, func(a float64) bool { return a > 2000 && a < 2900 }, 0.3, 0.9)
+	}
+}
+
+// round 3: activity fallback (no text matches): early subs fully corrected; late jumps refused
+func TestReviewActivityFallback(t *testing.T) {
+	mk := func(shift func(float64) float64) ([]Cue, [][2]float64, float64) {
+		cues, words := synth(500, 31)
+		var speech [][2]float64
+		for _, w := range words {
+			speech = append(speech, [2]float64{w.Start, w.Start + 0.3})
+		}
+		out := make([]Cue, len(cues))
+		for i, c := range cues {
+			out[i] = Cue{Start: shift(c.Start), End: shift(c.End), Tokens: []string{"x", fmt.Sprint(i)}}
+		}
+		return out, speech, cues[len(cues)-1].End + 10
+	}
+	for _, off := range []float64{1, 2, 4} {
+		cues, speech, dur := mk(func(t float64) float64 { return t - off }) // subtitles early
+		r := Analyze(cues, nil, speech, [][2]float64{{0, dur}}, dur, DefaultParams(), false)
+		if r.Status != "needs_fix" || math.Abs(r.Mapping.Pieces[0].Offset-off) > 0.15 {
+			t.Errorf("early by %.0f s: %s %s", off, r.Status, r.Message)
+		}
+	}
+	for _, at := range []float64{0.85, 0.92} {
+		var cut float64
+		cues, speech, dur := mk(func(t float64) float64 {
+			if cut > 0 && t > cut {
+				return t + 6
+			}
+			return t
+		})
+		cut = at * dur
+		cues, speech, dur = mk(func(t float64) float64 {
+			if t > cut {
+				return t + 6
+			}
+			return t
+		})
+		r := Analyze(cues, nil, speech, [][2]float64{{0, dur}}, dur, DefaultParams(), false)
+		if r.Status == "needs_fix" {
+			t.Errorf("jump at %.0f%% written as a global shift: %s", at*100, r.Message)
+		}
 	}
 }

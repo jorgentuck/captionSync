@@ -151,8 +151,8 @@ func (d *Detector) Refine(t, until float64) (float64, bool) {
 	attack := floor + 0.15*(peak-floor)
 	ft := d.frame(t)
 
-	// t is inside speech only if speech keeps going after it (not just the previous line's tail)
-	inSpeech := d.above(ft, ft+40, attack) >= 0.7
+	// t is inside speech only if speech keeps going well after it (not just the previous line's tail)
+	inSpeech := d.above(ft, ft+60, attack) >= 0.7
 
 	for f := lo; f+12 < hi; f++ {
 		// candidate: 120 ms mostly loud, coming out of mostly quiet (the previous 150 ms)
@@ -167,6 +167,10 @@ func (d *Detector) Refine(t, until float64) (float64, bool) {
 			need = 60
 		}
 		if d.above(f, f+need, attack) < 0.75 {
+			continue
+		}
+		// a short burst that falls back to quiet (door, laugh, music sting) loses to a later onset
+		if d.burst(f, attack) && d.laterCandidate(f, hi, thr, attack) {
 			continue
 		}
 		after := float64(f)*frameSec > t+0.1
@@ -186,4 +190,25 @@ func (d *Detector) Refine(t, until float64) (float64, bool) {
 		return float64(f) * frameSec, true
 	}
 	return t, false
+}
+
+// burst: the loud run starting at f falls back to 200 ms of quiet within 600 ms.
+func (d *Detector) burst(f int, attack float64) bool {
+	for k := f + 10; k < f+60 && k+20 <= len(d.db); k++ {
+		if d.above(k, k+20, attack) < 0.1 {
+			return true
+		}
+	}
+	return false
+}
+
+// laterCandidate: another sustained, speech-like onset follows f before hi.
+func (d *Detector) laterCandidate(f, hi int, thr, attack float64) bool {
+	for g := f + 30; g+40 < hi; g++ {
+		if d.db[g] >= thr && d.above(g, g+12, thr) >= 0.83 && d.above(g-15, g, thr) <= 0.2 &&
+			d.above(g, g+40, attack) >= 0.75 && !d.burst(g, attack) {
+			return true
+		}
+	}
+	return false
 }

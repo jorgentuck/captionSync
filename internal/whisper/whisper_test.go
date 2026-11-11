@@ -49,3 +49,17 @@ func TestChunkWordLevel(t *testing.T) {
 		t.Fatalf("got %+v", c)
 	}
 }
+
+func TestChunkPunctuationLedSegmentsKeepAnchor(t *testing.T) {
+	c := parse(t, `{"segments":[
+		{"start":1.0,"end":2.0,"text":" >> Who's there?"},
+		{"start":3.0,"end":4.0,"text":" ... Nobody."},
+		{"start":5.0,"end":6.0,"text":" — Fine."},
+		{"start":7.0,"end":8.0,"text":" [Music] Hello."}]}`)
+	want := map[string]bool{"Who's": true, "Nobody.": true, "Fine.": true, "Hello.": false}
+	for _, w := range c.Words {
+		if exp, ok := want[w.Text]; ok && w.Reliable != exp {
+			t.Errorf("%q reliable=%v, want %v", w.Text, w.Reliable, exp)
+		}
+	}
+}

@@ -286,6 +286,9 @@ func (p *Processor) Process(ctx context.Context, path, reason string, progress f
 			if t.result.Status == "needs_fix" {
 				t.result.Status, t.result.Reason = "uncertain", "needs_full"
 				t.result.Message += " - needs a full analysis (" + why + "), left unchanged"
+			} else if t.result.Status == "in_sync" && t.result.SampleDisagrees {
+				t.result.Status, t.result.Reason = "uncertain", "needs_full"
+				t.result.Message = "Mostly in sync, but part of the film disagrees - needs a full analysis (" + why + "), left unchanged"
 			} else if t.result.Status == "in_sync" {
 				t.result.Message += " (sampled only; " + why + ")"
 			}
@@ -705,9 +708,9 @@ func speechSpans(words []align.Word) [][2]float64 {
 
 // refineStarts replaces whisper's segment start times (often in the silence before a line, up to
 // seconds early) with the speech onset measured in the audio. A segment whose onset can't be found
-// clearly is no longer treated as a trustworthy timing anchor. Afterwards each segment's other
-// words are spread between its (refined) start and the next segment's (refined) start, so the text
-// stays in time order.
+// clearly is no longer treated as a trustworthy timing anchor. Each refined segment's words move
+// with its start (keeping whisper's spacing), clamped before the next segment, so the text stays
+// in time order.
 func refineStarts(words []whisper.Word, pcm []byte, length float64) {
 	det := onset.New(pcm)
 	var idx []int
@@ -720,37 +723,46 @@ func refineStarts(words []whisper.Word, pcm []byte, length float64) {
 		return
 	}
 	// pass 1: refine every segment start against whisper's (unrefined) next start
+	orig := make([]float64, len(idx))
 	starts := make([]float64, len(idx))
+	prevRefined := -1.0
 	for k, i := range idx {
+		orig[k] = words[i].Start
+		starts[k] = words[i].Start
 		until := length
 		if k+1 < len(idx) {
 			until = words[idx[k+1]].Start
 		}
 		t, ok := det.Refine(words[i].Start, until)
-		starts[k] = words[i].Start
 		switch {
 		case !ok || t < 0.3:
 			words[i].Reliable = false // no clear onset, or at the chunk's very first moment
 		case k == 0 && words[i].Start < 1.0 && det.ActiveAtStart():
 			words[i].Reliable = false // the chunk opened mid-sentence: this "start" isn't one
+		case t <= prevRefined+0.05:
+			words[i].Reliable = false // same onset as the previous segment: it belongs to that one
 		default:
 			starts[k] = t
+			prevRefined = t
 		}
 	}
-	// pass 2: move every segment's words into [its start, next start)
+	// pass 2: shift each refined segment's words by the same amount as its start
 	for k, i := range idx {
-		next, end := len(words), length
+		next, limit := len(words), length
 		if k+1 < len(idx) {
-			next, end = idx[k+1], starts[k+1]
+			next, limit = idx[k+1], starts[k+1]
 		}
-		n := next - i
-		if n <= 0 || end <= starts[k] {
-			continue
-		}
-		step := math.Min((end-starts[k])/float64(n), 1.0)
-		for j := 0; j < n; j++ {
-			words[i+j].Start = starts[k] + float64(j)*step
-			words[i+j].End = words[i+j].Start + step
+		shift := starts[k] - orig[k]
+		prev := starts[k]
+		for j := i; j < next; j++ {
+			st := words[j].Start + shift
+			if j == i {
+				st = starts[k]
+			}
+			st = math.Max(prev, math.Min(st, limit-0.01))
+			dur := words[j].End - words[j].Start
+			words[j].Start, words[j].End = st, math.Min(st+math.Max(dur, 0.05), limit)
+			prev = st
 		}
 	}
 }
