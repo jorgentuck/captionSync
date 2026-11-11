@@ -32,7 +32,7 @@ func (o *OpenAI) Transcribe(ctx context.Context, pcm []byte, language string) (*
 	if o.cfg.OpenAIKey != "" {
 		headers["Authorization"] = "Bearer " + o.cfg.OpenAIKey
 	}
-	return postTranscription(ctx, o.client, o.cfg.OpenAIBaseURL+"/audio/transcriptions", headers, fields, pcm)
+	return postTranscription(ctx, o.client, o.cfg.OpenAIBaseURL+"/audio/transcriptions", headers, fields, pcm, 4)
 }
 
 func (o *OpenAI) Status() map[string]any {

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jorgentuck/captionSync/internal/config"
@@ -24,7 +25,9 @@ type Local struct {
 	cfg    *config.Config
 	client *http.Client
 
-	dlMu     sync.Mutex // serialises model downloads
+	dlMu     sync.Mutex   // serialises model downloads
+	stopping atomic.Bool  // set while we stop the server on purpose
+	lastExit atomic.Value // string: why the server last exited unexpectedly
 	mu       sync.Mutex
 	cmd      *exec.Cmd
 	exited   chan struct{}
@@ -186,7 +189,16 @@ func (l *Local) launch(ctx context.Context, bin string) error {
 		return err
 	}
 	exited := make(chan struct{})
-	go func() { _ = cmd.Wait(); close(exited) }()
+	l.stopping.Store(false)
+	go func() {
+		err := cmd.Wait()
+		if !l.stopping.Load() {
+			why := fmt.Sprintf("%v; last output: %s", err, logw.tail())
+			l.lastExit.Store(why)
+			slog.Warn("whisper server exited unexpectedly (will restart on next request)", "why", why)
+		}
+		close(exited)
+	}()
 
 	deadline := time.Now().Add(3 * time.Minute)
 	for time.Now().Before(deadline) {
@@ -215,6 +227,7 @@ func (l *Local) stop() {
 	if l.cmd == nil {
 		return
 	}
+	l.stopping.Store(true)
 	_ = l.cmd.Process.Signal(os.Interrupt)
 	select {
 	case <-l.exited:
@@ -236,21 +249,24 @@ func (l *Local) reaper() {
 	}
 }
 
-func (l *Local) Transcribe(ctx context.Context, pcm []byte, language string) (*Chunk, error) {
+// crashed reports whether the running server process has died.
+func (l *Local) crashed() bool {
 	l.mu.Lock()
-	if err := l.start(ctx); err != nil {
-		l.mu.Unlock()
-		return nil, err
+	defer l.mu.Unlock()
+	if l.cmd == nil {
+		return true
 	}
-	l.inflight++
-	l.lastUsed = time.Now()
-	l.mu.Unlock()
-	defer func() {
-		l.mu.Lock()
-		l.inflight--
-		l.lastUsed = time.Now()
-		l.mu.Unlock()
-	}()
+	select {
+	case <-l.exited:
+		return true
+	default:
+		return false
+	}
+}
+
+// Transcribe sends one chunk to the server. If the server dies (e.g. out of GPU memory or a
+// whisper.cpp crash), it is restarted and the chunk retried, so one crash doesn't fail the file.
+func (l *Local) Transcribe(ctx context.Context, pcm []byte, language string) (*Chunk, error) {
 	if language == "" {
 		language = "auto"
 	}
@@ -258,7 +274,35 @@ func (l *Local) Transcribe(ctx context.Context, pcm []byte, language string) (*C
 		// Plain segments: their start times are accurate; per-word splitting (max_len=1) is not.
 		{"response_format", "verbose_json"}, {"temperature", "0.0"}, {"language", language},
 	}
-	return postTranscription(ctx, l.client, l.url("/inference"), nil, fields, pcm)
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		l.mu.Lock()
+		if err := l.start(ctx); err != nil {
+			l.mu.Unlock()
+			return nil, err
+		}
+		l.inflight++
+		l.lastUsed = time.Now()
+		l.mu.Unlock()
+
+		chunk, err := postTranscription(ctx, l.client, l.url("/inference"), nil, fields, pcm, 2)
+
+		l.mu.Lock()
+		l.inflight--
+		l.lastUsed = time.Now()
+		l.mu.Unlock()
+		if err == nil || ctx.Err() != nil {
+			return chunk, err
+		}
+		lastErr = err
+		if !l.crashed() {
+			return nil, err // a real error from a healthy server
+		}
+		why, _ := l.lastExit.Load().(string)
+		slog.Warn("whisper server died during a request; restarting and retrying", "attempt", attempt+1, "why", why)
+	}
+	why, _ := l.lastExit.Load().(string)
+	return nil, fmt.Errorf("whisper server keeps crashing on this audio (%v). Server said: %s", lastErr, why)
 }
 
 func (l *Local) Status() map[string]any {

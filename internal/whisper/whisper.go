@@ -147,9 +147,9 @@ func (v *verboseJSON) chunk() *Chunk {
 }
 
 func postTranscription(ctx context.Context, client *http.Client, url string, headers map[string]string,
-	fields [][2]string, pcm []byte) (*Chunk, error) {
+	fields [][2]string, pcm []byte, attempts int) (*Chunk, error) {
 	var lastErr error
-	for attempt := 0; attempt < 4; attempt++ {
+	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
