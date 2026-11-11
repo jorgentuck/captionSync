@@ -50,6 +50,7 @@ tr.clickable:hover td{background:var(--chip)}
 .chip{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:var(--chip);white-space:nowrap}
 .s-fixed{color:var(--ok)} .s-in_sync{color:var(--ok)} .s-needs_fix{color:var(--warn)} .s-uncertain{color:var(--warn)}
 .s-embedded{color:var(--info)} .s-failed{color:var(--bad)} .s-missing{color:var(--muted)} .s-no_subs{color:var(--muted)} .s-queued,.s-processing{color:var(--info)}
+.prio2{color:var(--info);font-weight:600} .prio1{color:var(--warn)} .prio0{color:var(--muted)}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 .pager{display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:10px}
 dialog{border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--text);max-width:900px;width:calc(100% - 32px);padding:0}
@@ -182,7 +183,8 @@ async function refreshStatus(){
     `<div class="muted">${sc.done?"✓":"…"} ${esc(sc.label)} — found ${sc.found}, queued ${sc.queued}, skipped ${sc.skipped}${sc.error?" · "+esc(sc.error):""}</div>`).join("");
   const qn = s.stats.queued||0;
   $("#queueInfo").textContent = qn ? `${qn} queued` : "Queue empty";
-  $("#queue").innerHTML = s.queue.map(q=>`<div class="path">${esc(q.path)}</div>`).join("") + (qn>s.queue.length?`<div class="muted">… and ${qn-s.queue.length} more</div>`:"");
+  const PRIO = ["bulk","picked","next"];
+  $("#queue").innerHTML = s.queue.map(q=>`<div class="path"><span class="chip prio${q.priority}" title="${esc(q.reason)}">${PRIO[q.priority]||q.priority}</span> ${esc(q.path)}</div>`).join("") + (qn>s.queue.length?`<div class="muted">… and ${qn-s.queue.length} more</div>`:"");
 }
 
 async function refreshFiles(){

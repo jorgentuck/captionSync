@@ -181,7 +181,7 @@ func (s *Service) Resolve(path string) (string, error) {
 
 // EnqueueFile queues one video (or the video a subtitle file belongs to).
 // Returns "queued", "skipped", "already" or "missing".
-func (s *Service) EnqueueFile(path, reason string, force bool) (string, error) {
+func (s *Service) EnqueueFile(path, reason string, force bool, priority int) (string, error) {
 	p, err := s.Resolve(path)
 	if err != nil {
 		return "", err
@@ -194,7 +194,7 @@ func (s *Service) EnqueueFile(path, reason string, force bool) (string, error) {
 		s.store.MarkMissing(p)
 		return "missing", nil
 	}
-	return s.store.Enqueue(p, sig, reason, force)
+	return s.store.Enqueue(p, sig, reason, force, priority)
 }
 
 func (s *Service) newScan(label string) *Scan {
@@ -232,7 +232,7 @@ func (s *Service) done(sc *Scan, err error) {
 }
 
 // ScanPath walks a folder (or a root) in the background, queuing new/changed videos (or all, with force).
-func (s *Service) ScanPath(root, reason string, force bool) (*Scan, error) {
+func (s *Service) ScanPath(root, reason string, force bool, priority int) (*Scan, error) {
 	p := filepath.Clean(s.lib.MapPath(root))
 	if !s.lib.Allowed(p) {
 		return nil, ErrNotAllowed
@@ -247,7 +247,7 @@ func (s *Service) ScanPath(root, reason string, force bool) (*Scan, error) {
 	sc := s.newScan(label)
 	go func() {
 		err := s.lib.WalkVideos(p, func(v string) error {
-			res, err := s.EnqueueFile(v, reason, force)
+			res, err := s.EnqueueFile(v, reason, force, priority)
 			if err != nil {
 				slog.Warn("enqueue", "path", v, "err", err)
 			}
@@ -259,11 +259,11 @@ func (s *Service) ScanPath(root, reason string, force bool) (*Scan, error) {
 	return sc, nil
 }
 
-// ScanAll scans every media root.
+// ScanAll scans every media root at bulk priority, so new arrivals and hand-picked work go first.
 func (s *Service) ScanAll(reason string, force bool) []*Scan {
 	var out []*Scan
 	for _, r := range s.cfg.MediaRoots {
-		if sc, err := s.ScanPath(r, reason, force); err == nil {
+		if sc, err := s.ScanPath(r, reason, force, store.PriorityBulk); err == nil {
 			out = append(out, sc)
 		} else {
 			slog.Warn("scan root", "root", r, "err", err)
@@ -281,7 +281,7 @@ func (s *Service) RequeueStatus(statuses []string, reason string) (*Scan, error)
 	sc := s.newScan(fmt.Sprintf("%s: %v", reason, statuses))
 	go func() {
 		for _, p := range paths {
-			res, err := s.EnqueueFile(p, reason, true)
+			res, err := s.EnqueueFile(p, reason, true, store.PriorityUser)
 			if err != nil {
 				slog.Warn("requeue", "path", p, "err", err)
 			}

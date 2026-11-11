@@ -167,7 +167,7 @@ func (s *Server) process(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if st.IsDir() {
-		sc, err := s.svc.ScanPath(p, "manual folder", req.Force)
+		sc, err := s.svc.ScanPath(p, "manual folder", req.Force, store.PriorityUser)
 		if err != nil {
 			writeErr(w, 400, err)
 			return
@@ -175,7 +175,7 @@ func (s *Server) process(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 202, map[string]any{"kind": "folder", "scan": sc.ID})
 		return
 	}
-	res, err := s.svc.EnqueueFile(p, "manual", req.Force)
+	res, err := s.svc.EnqueueFile(p, "manual", req.Force, store.PriorityNow)
 	if err != nil {
 		writeErr(w, 400, err)
 		return
@@ -257,7 +257,7 @@ func (s *Server) hook(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errors.New("no file path supplied (use path, file, episode or subtitles)"))
 		return
 	}
-	res, err := s.svc.EnqueueFile(path, "hook:"+r.PathValue("source"), false)
+	res, err := s.svc.EnqueueFile(path, "hook:"+r.PathValue("source"), false, store.PriorityNow)
 	if err != nil {
 		writeErr(w, 400, err)
 		return

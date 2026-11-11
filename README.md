@@ -89,6 +89,11 @@ Plain Docker / Compose: see `docker-compose.yml`. To build the image yourself: `
 * **Force**: re-check even if nothing changed.
 * **Pause / Clear queue**.
 
+**Queue order:** new arrivals (watcher, Bazarr/Tdarr hooks) and single files you pick go first ("next").
+Folders and status re-checks you start come after them ("picked"), and **Process all** / scheduled scans run in
+the background ("bulk"). So a multi-day first pass never delays new subtitles. If a file waiting in the bulk
+queue gets a hook or watcher event, it moves up.
+
 Click any file for per-subtitle details: matched lines, shift per segment, drift, and history.
 
 ## Automatic triggers

@@ -26,6 +26,13 @@ const (
 	New        = "new" // dequeued before processing
 )
 
+// Queue priorities: higher runs first, then oldest first.
+const (
+	PriorityBulk = 0 // "process all", scheduled / startup scans
+	PriorityUser = 1 // a folder or status re-check you started
+	PriorityNow  = 2 // watcher, Bazarr/Tdarr hooks, a single file you picked
+)
+
 var terminal = map[string]bool{Fixed: true, InSync: true, NeedsFix: true, Uncertain: true, NoSubs: true, Embedded: true, Failed: true, Missing: true}
 
 // AllStatuses is the display order used by the UI.
@@ -106,7 +113,25 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	return &Store{db: db, wake: make(chan struct{}, 1)}, nil
+}
+
+// migrate upgrades databases created by older versions in place.
+func migrate(db *sql.DB) error {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='priority'`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		if _, err := db.Exec(`ALTER TABLE files ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_files_queue ON files(status, priority DESC, queued_at, id)`)
+	return err
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -125,18 +150,21 @@ func (s *Store) history(id int64, status, msg string) {
 	_, _ = s.db.Exec(`INSERT INTO history(file_id, ts, status, message) VALUES(?,?,?,?)`, id, now(), status, msg)
 }
 
-// Enqueue queues a file. Result: "queued", "skipped" (handled before, unchanged) or "already".
-func (s *Store) Enqueue(path, signature, reason string, force bool) (string, error) {
+// Enqueue queues a file with a priority (PriorityBulk/User/Now).
+// Result: "queued", "skipped" (handled before, unchanged) or "already" (waiting or running;
+// a waiting file is bumped up if the new request has a higher priority).
+func (s *Store) Enqueue(path, signature, reason string, force bool, priority int) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t := now()
 	var id int64
 	var status, sig string
-	err := s.db.QueryRow(`SELECT id, status, signature FROM files WHERE path=?`, path).Scan(&id, &status, &sig)
+	var prio int
+	err := s.db.QueryRow(`SELECT id, status, signature, priority FROM files WHERE path=?`, path).Scan(&id, &status, &sig, &prio)
 	switch {
 	case err == sql.ErrNoRows:
-		res, err := s.db.Exec(`INSERT INTO files(path, status, reason, queued_at, created_at, updated_at) VALUES(?,?,?,?,?,?)`,
-			path, Queued, reason, t, t, t)
+		res, err := s.db.Exec(`INSERT INTO files(path, status, reason, priority, queued_at, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`,
+			path, Queued, reason, priority, t, t, t)
 		if err != nil {
 			return "", err
 		}
@@ -144,14 +172,24 @@ func (s *Store) Enqueue(path, signature, reason string, force bool) (string, err
 	case err != nil:
 		return "", err
 	default:
-		if status == Queued || status == Processing {
+		if status == Queued {
+			if priority > prio {
+				if _, err := s.db.Exec(`UPDATE files SET priority=?, reason=?, updated_at=? WHERE id=?`, priority, reason, t, id); err != nil {
+					return "", err
+				}
+				s.history(id, Queued, reason+" (moved up the queue)")
+				s.notify()
+			}
+			return "already", nil
+		}
+		if status == Processing {
 			return "already", nil
 		}
 		if !force && terminal[status] && sig == signature {
 			return "skipped", nil
 		}
-		if _, err := s.db.Exec(`UPDATE files SET status=?, prev_status=?, reason=?, queued_at=?, updated_at=? WHERE id=?`,
-			Queued, status, reason, t, t, id); err != nil {
+		if _, err := s.db.Exec(`UPDATE files SET status=?, prev_status=?, reason=?, priority=?, queued_at=?, updated_at=? WHERE id=?`,
+			Queued, status, reason, priority, t, t, id); err != nil {
 			return "", err
 		}
 	}
@@ -160,13 +198,13 @@ func (s *Store) Enqueue(path, signature, reason string, force bool) (string, err
 	return "queued", nil
 }
 
-// ClaimNext atomically takes the oldest queued file.
+// ClaimNext atomically takes the next file: highest priority first, then oldest.
 func (s *Store) ClaimNext() (*File, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var id int64
 	var path, reason string
-	err := s.db.QueryRow(`SELECT id, path, reason FROM files WHERE status=? ORDER BY queued_at, id LIMIT 1`, Queued).
+	err := s.db.QueryRow(`SELECT id, path, reason FROM files WHERE status=? ORDER BY priority DESC, queued_at, id LIMIT 1`, Queued).
 		Scan(&id, &path, &reason)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -331,11 +369,12 @@ type QueueItem struct {
 	ID       int64   `json:"id"`
 	Path     string  `json:"path"`
 	Reason   string  `json:"reason"`
+	Priority int     `json:"priority"`
 	QueuedAt float64 `json:"queued_at"`
 }
 
 func (s *Store) Queue(limit int) ([]QueueItem, error) {
-	rows, err := s.db.Query(`SELECT id, path, reason, queued_at FROM files WHERE status=? ORDER BY queued_at, id LIMIT ?`, Queued, limit)
+	rows, err := s.db.Query(`SELECT id, path, reason, priority, queued_at FROM files WHERE status=? ORDER BY priority DESC, queued_at, id LIMIT ?`, Queued, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +382,7 @@ func (s *Store) Queue(limit int) ([]QueueItem, error) {
 	out := []QueueItem{}
 	for rows.Next() {
 		var q QueueItem
-		if err := rows.Scan(&q.ID, &q.Path, &q.Reason, &q.QueuedAt); err != nil {
+		if err := rows.Scan(&q.ID, &q.Path, &q.Reason, &q.Priority, &q.QueuedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, q)

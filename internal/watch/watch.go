@@ -16,10 +16,11 @@ import (
 
 	"github.com/jorgentuck/captionSync/internal/config"
 	"github.com/jorgentuck/captionSync/internal/library"
+	"github.com/jorgentuck/captionSync/internal/store"
 )
 
 type Enqueuer interface {
-	EnqueueFile(path, reason string, force bool) (string, error)
+	EnqueueFile(path, reason string, force bool, priority int) (string, error)
 }
 
 type pending struct {
@@ -111,7 +112,7 @@ func (w *Watcher) settle(ctx context.Context) {
 		w.mu.Unlock()
 
 		for _, p := range ready {
-			res, err := w.q.EnqueueFile(p, "watcher", false)
+			res, err := w.q.EnqueueFile(p, "watcher", false, store.PriorityNow)
 			switch {
 			case err != nil:
 				slog.Debug("watcher skip", "path", p, "err", err)
