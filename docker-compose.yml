@@ -8,7 +8,9 @@ services:
       - "8080:8080"
     volumes:
       - ./config:/config            # database, downloaded model, subtitle backups
-      - /mnt/user/media:/media      # must be read-write: subtitle files are rewritten in place
+      # must be read-write: subtitle files are rewritten in place. Everything under /media is scanned.
+      - /mnt/user/movies:/media/movies
+      - /mnt/user/tv:/media/tv
     environment:
       PUID: "99"
       PGID: "100"
@@ -17,7 +19,7 @@ services:
       WORKERS: "2"                  # parallel files (ffmpeg overlaps with GPU work)
       WATCH_MODE: "inotify"
       SETTLE_SECONDS: "90"
-      # PATH_MAPPINGS: "/data/media:/media"   # if Tdarr/Bazarr see the library under a different path
+      # PATH_MAPPINGS: "/movies:/media/movies,/tv:/media/tv"   # how Bazarr/Tdarr see the folders (hooks only)
       EMBEDDED_SUBS: "report"       # report | remux | sidecar | off
       # DRY_RUN: "true"                       # report only, change nothing (good for a first pass)
     deploy:

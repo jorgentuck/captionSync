@@ -56,7 +56,9 @@ The image is built automatically by GitHub Actions and published as
 3. Go to **Docker → Add Container**. Under **Template**, pick **captionSync**
    (in the *User templates* section).
 4. Check the settings:
-   * **Media**: your library share, e.g. `/mnt/user/media`. It must stay **read-write**, because subtitle files are rewritten.
+   * **Movies** and **TV**: your two library folders, e.g. `/mnt/user/movies` and `/mnt/user/tv`. Use the folder picker to choose your real paths.
+     Inside the container they appear as `/media/movies` and `/media/tv`, and both are scanned and watched. They must stay **read-write**, because subtitle files are rewritten.
+     For a third folder (e.g. anime), click *Add another Path* and set its container path to `/media/anime`.
    * **AppData**: `/mnt/user/appdata/captionsync`
    * **NVIDIA_VISIBLE_DEVICES**: your GPU UUID or `all`. The template already adds `--runtime=nvidia`.
    * **Dry run**: set `true` for your first pass if you'd like to see what it would change first.
@@ -64,8 +66,10 @@ The image is built automatically by GitHub Actions and published as
 
 The first run downloads the whisper model (~190 MB) and a tiny voice-activity model into `/config/models`.
 
-**Paths must match.** CaptionSync sees your library as `/media/...`. If Bazarr or Tdarr call the hook with
-their own paths (e.g. `/tv/...`), set **Path mappings**, e.g. `/tv:/media/tv,/movies:/media/movies`.
+**Paths for hooks.** captionSync sees your folders as `/media/movies/...` and `/media/tv/...`. The Bazarr and
+Tdarr hooks send paths the way *those* containers see them. Look at their path mappings and set **Path mappings**
+to match. For example, if Bazarr has `/mnt/user/movies → /movies` and `/mnt/user/tv → /tv`, use
+`/movies:/media/movies,/tv:/media/tv`. The file watcher doesn't need this.
 
 **Updating:** after a new image is published, click the container's icon → **Check for Updates** (or
 **Force Update**).
