@@ -146,8 +146,20 @@ func fmtClock(t float64, sep string) string {
 
 // --- ASS / SSA -------------------------------------------------------------
 
+// parseASSClock reads H:MM:SS.cc; the fraction is an integer count of centiseconds, as libass and
+// ffmpeg read it ("0:00:01.5" = 1.05 s).
 func parseASSClock(s string) (float64, bool) {
-	return parseClock(strings.TrimSpace(s), false)
+	s = strings.TrimSpace(s)
+	whole, frac, found := strings.Cut(s, ".")
+	if !found {
+		return parseClock(s, false)
+	}
+	t, ok := parseClock(whole+".0", false)
+	cs, err := strconv.Atoi(frac)
+	if !ok || err != nil {
+		return 0, false
+	}
+	return t + float64(cs)/100, true
 }
 
 func fmtASSClock(t float64) string {
@@ -155,10 +167,14 @@ func fmtASSClock(t float64) string {
 	return fmt.Sprintf("%d:%02d:%02d.%02d", cs/360000, cs/6000%60, cs/100%60, cs%100)
 }
 
+// ASS event kinds: Dialogue lines are matched against speech; the others are only shifted along.
+var assShiftOnly = map[string]bool{"comment": true, "picture": true, "sound": true, "movie": true, "command": true}
+
 func (f *File) parseASS() error {
 	inEvents := false
 	var format []string
-	for i, line := range f.lines {
+	for i, raw := range f.lines {
+		line, eol := strings.CutSuffix(raw, "\r") // keep a CRLF line's \r out of the fields
 		t := strings.TrimSpace(strings.TrimPrefix(line, "\uFEFF"))
 		if strings.HasPrefix(t, "[") {
 			inEvents = strings.EqualFold(t, "[Events]")
@@ -171,41 +187,53 @@ func (f *File) parseASS() error {
 		if colon < 0 {
 			continue
 		}
-		kind := strings.TrimSpace(line[:colon])
+		kind := strings.ToLower(strings.TrimSpace(line[:colon]))
 		body := line[colon+1:]
-		if strings.EqualFold(kind, "Format") {
+		if kind == "format" {
 			format = nil
 			for _, fld := range strings.Split(body, ",") {
 				format = append(format, strings.ToLower(strings.TrimSpace(fld)))
 			}
+			for len(format) > 0 && format[len(format)-1] == "" { // "Format: ..., Text," trailing comma
+				format = format[:len(format)-1]
+			}
 			continue
 		}
-		isDialogue := strings.EqualFold(kind, "Dialogue")
-		if !isDialogue && !strings.EqualFold(kind, "Comment") {
+		isDialogue := kind == "dialogue"
+		if !isDialogue && !assShiftOnly[kind] {
 			continue
 		}
 		if format == nil {
 			format = []string{"layer", "start", "end", "style", "name", "marginl", "marginr", "marginv", "effect", "text"}
 		}
-		fields := strings.SplitN(body, ",", len(format))
-		si, ei := indexOf(format, "start"), indexOf(format, "end")
+		si, ei, ti := indexOf(format, "start"), indexOf(format, "end"), indexOf(format, "text")
 		if si < 0 || ei < 0 {
 			return fmt.Errorf("ASS Format line has no Start/End")
 		}
+		// Text may contain commas, so only a Text column that comes last absorbs the rest of the line.
+		n := len(format)
+		if ti >= 0 && ti != n-1 {
+			n = -1
+		}
+		fields := strings.SplitN(body, ",", n)
 		if si >= len(fields) || ei >= len(fields) {
 			continue // not even the times are present: leave this line alone
 		}
 		text := ""
-		if len(fields) == len(format) {
-			text = fields[len(fields)-1] // short (malformed) lines are still retimed, just not matched
+		if ti >= 0 && ti < len(fields) && len(fields) >= len(format) {
+			text = fields[ti] // short (malformed) lines are still retimed, just not matched
 		}
 		st, ok1 := parseASSClock(fields[si])
 		en, ok2 := parseASSClock(fields[ei])
 		if !ok1 || !ok2 {
 			continue
 		}
-		f.entries = append(f.entries, entry{line: i, start: st, end: en, cue: isDialogue,
-			text: toUTF8(strings.TrimSuffix(text, "\r")), prefix: line[:colon+1], fields: fields, startF: si, endF: ei})
+		e := entry{line: i, start: st, end: en, cue: isDialogue,
+			text: toUTF8(text), prefix: line[:colon+1], fields: fields, startF: si, endF: ei}
+		if eol {
+			e.srtRest = "\r" // ASS lines don't use srtRest otherwise: it carries the line ending back
+		}
+		f.entries = append(f.entries, e)
 	}
 	return nil
 }
@@ -248,7 +276,7 @@ func (f *File) Retime(fn func(start, end float64) (float64, float64)) int {
 			fields := append([]string(nil), e.fields...)
 			fields[e.startF] = fmtASSClock(ns)
 			fields[e.endF] = fmtASSClock(ne)
-			line = e.prefix + strings.Join(fields, ",")
+			line = e.prefix + strings.Join(fields, ",") + e.srtRest
 		case "vtt":
 			line = fmtClock(ns, ".") + " --> " + fmtClock(ne, ".") + e.srtRest
 		default:

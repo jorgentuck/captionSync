@@ -18,15 +18,37 @@ type Library struct{ cfg *config.Config }
 
 func New(cfg *config.Config) *Library { return &Library{cfg: cfg} }
 
-// MapPath translates a path as another container (e.g. Tdarr) sees it into ours.
+// MapPath translates a path as another container (e.g. Tdarr) sees it into ours (longest
+// matching mapping wins).
 func (l *Library) MapPath(p string) string {
 	p = strings.TrimSpace(p)
-	for _, m := range l.cfg.PathMappings {
-		if p == m[0] || strings.HasPrefix(p, m[0]+"/") {
-			return m[1] + p[len(m[0]):]
+	best := -1
+	for i, m := range l.cfg.PathMappings {
+		if (p == m[0] || strings.HasPrefix(p, m[0]+"/")) && (best < 0 || len(m[0]) > len(l.cfg.PathMappings[best][0])) {
+			best = i
 		}
 	}
-	return p
+	if best < 0 {
+		return p
+	}
+	m := l.cfg.PathMappings[best]
+	return m[1] + p[len(m[0]):]
+}
+
+// SharedStem reports whether another video in the same folder has the same name (Movie.mkv and
+// Movie.mp4): their subtitle files can't be attributed to one of them safely.
+func (l *Library) SharedStem(video string) bool {
+	entries, err := os.ReadDir(filepath.Dir(video))
+	if err != nil {
+		return false
+	}
+	me, st := filepath.Base(video), stem(filepath.Base(video))
+	for _, e := range entries {
+		if !e.IsDir() && e.Name() != me && l.IsVideo(e.Name()) && stem(e.Name()) == st {
+			return true
+		}
+	}
+	return false
 }
 
 // Allowed reports whether p lies inside one of the configured media roots.

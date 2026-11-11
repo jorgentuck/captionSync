@@ -164,3 +164,35 @@ func TestShortASSLineStillRetimed(t *testing.T) {
 		t.Fatalf("short line not retimed: %q", got)
 	}
 }
+
+func TestASSRoundTwo(t *testing.T) {
+	// CRLF short line keeps its \r; Text not last; Sound events shift; trailing-comma Format; integer cs
+	src := "[Events]\r\n" +
+		"Format: Layer, Start, End, Text, Style\r\n" +
+		"Dialogue: 0,0:00:01.00,0:00:02.00,Hello there friend,Default\r\n" +
+		"Sound: 0,0:00:03.00,0:00:04.00,boom.wav,Default\r\n" +
+		"Dialogue: 0,0:00:05.5,0:00:06.00\r\n"
+	f, err := Load(write(t, "r2.ass", []byte(src)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := f.Cues()
+	if len(c) != 1 || c[0].Text != "Hello there friend" {
+		t.Fatalf("cues %+v", c)
+	}
+	f.Retime(identity)
+	if got := string(f.Bytes()); got != strings.Replace(src, "0:00:05.5,", "0:00:05.05,", 1) {
+		t.Fatalf("identity changed more than the normalised time:\n%q", got)
+	}
+	f.Retime(plus(1))
+	got := string(f.Bytes())
+	for _, want := range []string{"Sound: 0,0:00:04.00,0:00:05.00,boom.wav,Default\r\n", "Dialogue: 0,0:00:06.05,0:00:07.00\r\n"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in %q", want, got)
+		}
+	}
+	g, _ := Load(write(t, "tc.ass", []byte("[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text,\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,no commas here\n")))
+	if c := g.Cues(); len(c) != 1 || c[0].Text != "no commas here" {
+		t.Fatalf("trailing-comma format: %+v", c)
+	}
+}

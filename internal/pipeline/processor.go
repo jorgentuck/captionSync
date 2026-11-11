@@ -116,6 +116,10 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 		return Outcome{Status: store.Missing, Message: "File no longer exists"}
 	}
 	videoStamp := stampOf(path)
+	if p.lib.SharedStem(path) {
+		return Outcome{Status: store.Uncertain, Signature: sigBefore,
+			Message: "Another video in this folder has the same name; its subtitle files can't be matched to one of them safely, left unchanged"}
+	}
 	sidecarList := p.lib.Sidecars(path)
 	out := Outcome{Signature: sigBefore, Details: map[string]any{}}
 	p.cleanStaleTemps(path)
@@ -158,8 +162,11 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 					continue // exported on an earlier run; that sidecar is checked like any other
 				}
 			}
-			t := &track{name: "embedded " + ss.Label(), embedded: &ss, dst: dsts[ss.Index],
+			t := &track{name: "embedded " + ss.Label(), embedded: &ss,
 				path: filepath.Join(tmp, fmt.Sprintf("s%d.%s", ss.Index, ss.Format))}
+			if p.cfg.EmbeddedMode == "sidecar" {
+				t.dst = dsts[ss.Index]
+			}
 			tracks = append(tracks, t)
 			ex = append(ex, media.Extract{Rel: ss.Rel, Format: ss.Format, Out: t.path})
 		}
@@ -249,9 +256,14 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 		}
 		// a sampled result that asked for a full pass is never written
 		for _, t := range tracks {
-			if t.err == "" && tr.sampled && t.result.WantsFull {
+			if t.err != "" || !tr.sampled || !t.result.WantsFull {
+				continue
+			}
+			if t.result.Status == "needs_fix" {
 				t.result.Status = "uncertain"
 				t.result.Message += " - needs a full analysis (" + why + "), left unchanged"
+			} else if t.result.Status == "in_sync" {
+				t.result.Message += " (sampled only; " + why + ")"
 			}
 		}
 	}
@@ -621,9 +633,10 @@ func speechSpans(words []align.Word) [][2]float64 {
 }
 
 // refineStarts replaces whisper's segment start times (often in the silence before a line, up to
-// seconds early) with the speech onset measured in the audio. The segment's other words move with
-// it, so the text stays in time order. A segment whose onset can't be found clearly is no longer
-// treated as a trustworthy timing anchor.
+// seconds early) with the speech onset measured in the audio. A segment whose onset can't be found
+// clearly is no longer treated as a trustworthy timing anchor. Afterwards each segment's other
+// words are spread between its (refined) start and the next segment's (refined) start, so the text
+// stays in time order.
 func refineStarts(words []whisper.Word, pcm []byte, length float64) {
 	det := onset.New(pcm)
 	var idx []int
@@ -632,21 +645,41 @@ func refineStarts(words []whisper.Word, pcm []byte, length float64) {
 			idx = append(idx, i)
 		}
 	}
+	if len(idx) == 0 {
+		return
+	}
+	// pass 1: refine every segment start against whisper's (unrefined) next start
+	starts := make([]float64, len(idx))
 	for k, i := range idx {
-		until, next := length, len(words)
+		until := length
 		if k+1 < len(idx) {
-			until, next = words[idx[k+1]].Start, idx[k+1]
+			until = words[idx[k+1]].Start
 		}
 		t, ok := det.Refine(words[i].Start, until)
-		// an onset right at the chunk's first moment means the chunk opened mid-sentence
-		if !ok || t < 0.3 {
-			words[i].Reliable = false
+		starts[k] = words[i].Start
+		switch {
+		case !ok || t < 0.3:
+			words[i].Reliable = false // no clear onset, or at the chunk's very first moment
+		case k == 0 && words[i].Start < 1.0 && det.ActiveAtStart():
+			words[i].Reliable = false // the chunk opened mid-sentence: this "start" isn't one
+		default:
+			starts[k] = t
+		}
+	}
+	// pass 2: move every segment's words into [its start, next start)
+	for k, i := range idx {
+		next, end := len(words), length
+		if k+1 < len(idx) {
+			next, end = idx[k+1], starts[k+1]
+		}
+		n := next - i
+		if n <= 0 || end <= starts[k] {
 			continue
 		}
-		shift := t - words[i].Start
-		for j := i; j < next; j++ {
-			words[j].Start = math.Min(words[j].Start+shift, until-0.01)
-			words[j].End = math.Min(words[j].End+shift, until)
+		step := math.Min((end-starts[k])/float64(n), 1.0)
+		for j := 0; j < n; j++ {
+			words[i+j].Start = starts[k] + float64(j)*step
+			words[i+j].End = words[i+j].Start + step
 		}
 	}
 }
@@ -662,8 +695,14 @@ func (p *Processor) tmpRoot() string {
 // cleanStaleTemps removes our own leftover temp files next to this video (from a crash or a
 // killed container). Only files older than 6 hours, so a remux in progress is never touched.
 func (p *Processor) cleanStaleTemps(video string) {
-	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(video), ".*.captionsync.tmp*"))
-	for _, m := range matches {
+	dir := filepath.Dir(video)
+	entries, _ := os.ReadDir(dir) // no Glob: folder names like "Movie [imdbid-tt1]" are not patterns
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasPrefix(n, ".") || !strings.Contains(n, ".captionsync.tmp") {
+			continue
+		}
+		m := filepath.Join(dir, n)
 		if st, err := os.Stat(m); err == nil && time.Since(st.ModTime()) > 6*time.Hour {
 			if os.Remove(m) == nil {
 				slog.Info("removed stale temp file", "path", m)

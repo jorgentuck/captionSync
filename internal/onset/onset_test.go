@@ -80,3 +80,42 @@ func TestRefineAfterLongSilence(t *testing.T) {
 		t.Fatalf("got %.3f ok=%v, want ~9.0", got, ok)
 	}
 }
+
+// round 2: whisper start inside the previous line's last ~100 ms still finds the next onset
+func TestRefineStartInPreviousLineTail(t *testing.T) {
+	d := New(synth(0.02, [][2]float64{{2.0, 4.5}, {7.3, 9.5}}, 12))
+	for _, st := range []float64{4.3, 4.4} {
+		if got, ok := d.Refine(st, 11); !ok || math.Abs(got-7.3) > 0.06 {
+			t.Fatalf("t=%.1f: got %.3f ok=%v, want ~7.3", st, got, ok)
+		}
+	}
+}
+
+// round 2: a 150-300 ms sound before the line is not taken as the onset
+func TestRefineIgnoresMediumTransient(t *testing.T) {
+	for _, burst := range []float64{0.15, 0.2, 0.25} {
+		d := New(synth(0.02, [][2]float64{{2.0, 2.0 + burst}, {3.0, 5.5}}, 8))
+		if got, ok := d.Refine(1.5, 6); ok && math.Abs(got-3.0) > 0.06 {
+			t.Fatalf("burst %.2f: took %.3f", burst, got)
+		}
+	}
+}
+
+// round 2: fast dialogue - start inside a line, next phrase after a short pause -> not ok.
+// (A start in the line's last moments is the "previous line's tail" case, where the next onset is right.)
+func TestRefineFastDialogue(t *testing.T) {
+	d := New(synth(0.02, [][2]float64{{1.0, 3.0}, {3.4, 6.0}}, 8))
+	for st := 1.1; st < 2.7; st += 0.05 {
+		if got, ok := d.Refine(st, 7); ok && got > st+0.2 {
+			t.Fatalf("t=%.2f jumped to later phrase %.3f", st, got)
+		}
+	}
+}
+
+// round 2: a lone sound effect in a long silence is not an onset far from whisper's start
+func TestRefineLoneSFXFarAway(t *testing.T) {
+	d := New(synth(0.02, [][2]float64{{1.0, 2.0}, {9.0, 9.3}, {14.0, 16.0}}, 18))
+	if got, ok := d.Refine(2.0, 17); ok && math.Abs(got-14.0) > 0.06 {
+		t.Fatalf("took %.3f (SFX at 9.0)", got)
+	}
+}

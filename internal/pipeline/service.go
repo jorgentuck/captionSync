@@ -25,7 +25,10 @@ type Service struct {
 	proc  *Processor
 
 	paused     atomic.Bool
-	engineDown atomic.Int64 // unix nanos until which workers back off (engine unavailable)
+	engineDown atomic.Int64  // unix nanos until which workers back off (engine unavailable)
+	lastOK     atomic.Int64  // unix nanos of the last job the engine got through
+	lastOKID   atomic.Int64  // ...and which file that was
+	engFails   map[int64]int // consecutive engine failures per file (guarded by mu)
 	wg         sync.WaitGroup
 
 	mu      sync.Mutex
@@ -54,7 +57,7 @@ type Scan struct {
 }
 
 func NewService(cfg *config.Config, st *store.Store, lib *library.Library, proc *Processor) *Service {
-	return &Service{cfg: cfg, store: st, lib: lib, proc: proc, current: map[int]*Current{}}
+	return &Service{cfg: cfg, store: st, lib: lib, proc: proc, current: map[int]*Current{}, engFails: map[int64]int{}}
 }
 
 // Run starts the workers; returns immediately.
@@ -153,21 +156,58 @@ func (s *Service) handle(ctx context.Context, wid int, f *store.File) {
 		return // shutting down: leave it 'processing' so it is re-queued on start
 	}
 	if out.Requeue {
-		if out.EngineDown {
-			s.engineDown.Store(time.Now().Add(time.Minute).UnixNano())
-			slog.Warn("transcription engine unavailable; pausing workers for a minute", "err", out.Message)
-		}
-		if err := s.store.Requeue(f.ID, out.Message, !out.EngineDown); err != nil {
-			slog.Error("requeue", "err", err)
-		}
-		slog.Info("requeued", "path", f.Path, "why", out.Message)
+		s.requeue(f, out)
 		return
 	}
-	if err := s.store.Finish(f.ID, out.Status, out.Message, out.Signature, out.OffsetMs, out.Details); err != nil {
-		slog.Error("save result", "err", err)
+	switch out.Status {
+	case store.Fixed, store.InSync, store.NeedsFix, store.Uncertain:
+		s.lastOK.Store(time.Now().UnixNano())
+		s.lastOKID.Store(f.ID)
+	}
+	s.mu.Lock()
+	delete(s.engFails, f.ID)
+	s.mu.Unlock()
+	var err error
+	for i := 0; i < 3; i++ {
+		if err = s.store.Finish(f.ID, out.Status, out.Message, out.Signature, out.OffsetMs, out.Details); err == nil {
+			break
+		}
+		sleep(ctx, 2*time.Second)
+	}
+	if err != nil {
+		slog.Error("could not save result; re-queuing", "path", f.Path, "err", err)
+		_ = s.store.Requeue(f.ID, "result could not be saved: "+err.Error(), true, time.Minute)
+		return
 	}
 	slog.Info("done", "path", f.Path, "status", out.Status, "msg", out.Message,
 		"took", time.Since(cur.Started).Round(time.Second))
+}
+
+// requeue sends a file back to the queue without a result.
+//   - files changed during the run: wait a settle period, don't count it as an attempt;
+//   - engine failure while the engine has been working for other files: probably this file's
+//     audio (crashes/hangs whisper) - count it, so it ends up failed instead of looping;
+//   - engine failure with no recent success anywhere: an outage - pause all workers, don't count.
+func (s *Service) requeue(f *store.File, out Outcome) {
+	countAttempt, delay := false, s.cfg.Settle
+	if out.EngineDown {
+		delay = 0
+		recentOther := time.Since(time.Unix(0, s.lastOK.Load())) < 30*time.Minute && s.lastOKID.Load() != f.ID
+		s.mu.Lock()
+		s.engFails[f.ID]++
+		repeated := s.engFails[f.ID] >= 3 // the same file keeps failing it, even with nothing else to compare
+		s.mu.Unlock()
+		if recentOther || repeated {
+			countAttempt = true
+		} else {
+			s.engineDown.Store(time.Now().Add(time.Minute).UnixNano())
+			slog.Warn("transcription engine unavailable; pausing workers for a minute", "err", out.Message)
+		}
+	}
+	if err := s.store.Requeue(f.ID, out.Message, countAttempt, delay); err != nil {
+		slog.Error("requeue", "err", err)
+	}
+	slog.Info("requeued", "path", f.Path, "why", out.Message, "counted", countAttempt)
 }
 
 func (s *Service) Pause(p bool) { s.paused.Store(p) }

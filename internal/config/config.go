@@ -2,6 +2,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -60,6 +61,7 @@ type Config struct {
 	VideoExt       []string
 	SubExt         []string
 	PathMappings   [][2]string
+	HookToken      string // optional: required as X-Hook-Token header or ?token= on /api/hooks/*
 }
 
 var (
@@ -145,9 +147,29 @@ var iso639_2 = map[string]string{
 	"eng": "en", "ger": "de", "deu": "de", "fre": "fr", "fra": "fr", "spa": "es", "ita": "it", "jpn": "ja",
 	"por": "pt", "rus": "ru", "chi": "zh", "zho": "zh", "kor": "ko", "dut": "nl", "nld": "nl", "swe": "sv",
 	"nor": "no", "nob": "no", "dan": "da", "fin": "fi", "pol": "pl", "tur": "tr", "ara": "ar", "hin": "hi",
+	"nb": "no", "lit": "lt", "lav": "lv", "est": "et", "wel": "cy", "cym": "cy", "baq": "eu", "eus": "eu",
+	"geo": "ka", "kat": "ka", "arm": "hy", "hye": "hy", "mal": "ml", "tam": "ta", "ben": "bn", "urd": "ur",
+	"mac": "mk", "mkd": "mk", "alb": "sq", "sqi": "sq", "glg": "gl", "afr": "af", "bos": "bs", "tgl": "tl",
+	"fil": "tl", "lat": "la", "tel": "te", "kan": "kn", "mar": "mr", "pan": "pa", "guj": "gu",
 	"heb": "he", "cze": "cs", "ces": "cs", "gre": "el", "ell": "el", "hun": "hu", "rum": "ro", "ron": "ro",
 	"ukr": "uk", "vie": "vi", "tha": "th", "ind": "id", "may": "ms", "msa": "ms", "cat": "ca", "bul": "bg",
 	"hrv": "hr", "srp": "sr", "slv": "sl", "slo": "sk", "slk": "sk", "per": "fa", "fas": "fa", "ice": "is", "isl": "is",
+}
+
+// whisperLangs are the language codes whisper accepts.
+var whisperLangs = strings.Fields(`en zh de es ru ko fr ja pt tr pl ca nl ar sv it id hi fi vi he uk el ms cs ro
+da hu ta no th ur hr bg lt la mi ml cy sk te fa lv bn sr az sl kn et mk br eu is hy ne mn bs kk sq sw gl
+mr pa si km sn yo so af oc ka be tg sd gu am yi lo uz fo ht ps tk nn mt sa lb my bo tl mg as tt haw ln ha
+ba jw su yue`)
+
+// ValidLang reports whether whisper knows this (normalised) language code.
+func ValidLang(l string) bool {
+	for _, x := range whisperLangs {
+		if x == l {
+			return true
+		}
+	}
+	return false
 }
 
 // NormalizeLang turns "eng"/"English"/"EN" into whisper's "en"; unknown values pass through.
@@ -204,11 +226,17 @@ func Load() *Config {
 		PollInterval:   time.Duration(max(10, integer("POLL_INTERVAL", 60))) * time.Second,
 		ScanInterval:   time.Duration(integer("SCAN_INTERVAL_MINUTES", 0)) * time.Minute,
 		ScanOnStart:    boolean("SCAN_ON_START", false),
+		HookToken:      str("HOOK_TOKEN", ""),
 		IgnorePatterns: append(list("IGNORE_PATTERNS", defaultIgnore), InternalIgnore...),
 		VideoExt:       exts(list("VIDEO_EXTENSIONS", defaultVideoExt)),
 		SubExt:         exts(list("SUBTITLE_EXTENSIONS", defaultSubExt)),
 	}
 	c.WatchPaths = cleanPaths(list("WATCH_PATHS", roots))
+	if c.AudioLanguage != "" && !ValidLang(c.AudioLanguage) {
+		slog.Error("AUDIO_LANGUAGE is not a language whisper knows; ignoring it and auto-detecting",
+			"value", os.Getenv("AUDIO_LANGUAGE"))
+		c.AudioLanguage = ""
+	}
 	for i, l := range c.PreferredAudioLang {
 		c.PreferredAudioLang[i] = strings.ToLower(l)
 	}

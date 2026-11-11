@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func open(t *testing.T) *Store {
@@ -145,7 +146,7 @@ func TestRequeueKeepsPlaceAndEngineDownDoesNotCount(t *testing.T) {
 		if f == nil {
 			t.Fatalf("round %d: gave up on an engine outage", i)
 		}
-		s.Requeue(f.ID, "engine down", false)
+		s.Requeue(f.ID, "engine down", false, 0)
 	}
 }
 
@@ -160,5 +161,37 @@ func TestMarkMissingLeavesActiveFilesAlone(t *testing.T) {
 	// so it can't be queued (and claimed by a second worker) while still processing
 	if r, _ := s.Enqueue("/m/a", "sig", "watcher", false, PriorityNow); r != "already" {
 		t.Fatalf("enqueue while processing: %s", r)
+	}
+}
+
+func TestRequeueGoesToBackAndWaits(t *testing.T) {
+	s := open(t)
+	s.Enqueue("/m/a", "sig", "x", false, PriorityNow)
+	s.Enqueue("/m/b", "sig", "x", false, PriorityNow)
+	f, _ := s.ClaimNext() // a
+	s.Requeue(f.ID, "changed", false, 0)
+	if g, _ := s.ClaimNext(); g == nil || g.Path != "/m/b" {
+		t.Fatalf("requeued file should go behind b, got %+v", g)
+	}
+	g, _ := s.ClaimNext() // a again
+	s.Requeue(g.ID, "changed, settle", false, time.Hour)
+	if h, _ := s.ClaimNext(); h != nil {
+		t.Fatalf("claimed %s before its settle delay", h.Path)
+	}
+}
+
+func TestMigrationResetsOldAttempts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v1.db")
+	s1, _ := Open(path)
+	s1.Enqueue("/m/old", "sig", "x", false, 0)
+	f, _ := s1.ClaimNext()
+	s1.Finish(f.ID, InSync, "", "sig", nil, nil)
+	s1.db.Exec(`UPDATE files SET attempts=9`)
+	s1.db.Exec(`PRAGMA user_version = 1`)
+	s1.Close()
+	s2, _ := Open(path)
+	defer s2.Close()
+	if g, _ := s2.Get(f.ID); g.Attempts != 0 {
+		t.Fatalf("attempts %d after migration", g.Attempts)
 	}
 }

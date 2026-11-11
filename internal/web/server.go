@@ -168,7 +168,14 @@ func (s *Server) process(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errors.New("path is required"))
 		return
 	}
-	p := filepath.Clean(s.lib.MapPath(req.Path))
+	// The UI sends paths as this container sees them; only fall back to PATH_MAPPINGS for a path
+	// that is not one of ours (e.g. pasted from Bazarr/Tdarr).
+	p := filepath.Clean(strings.TrimSpace(req.Path))
+	if _, err := os.Stat(p); err != nil || !s.lib.Allowed(p) {
+		if m := filepath.Clean(s.lib.MapPath(req.Path)); s.lib.Allowed(m) {
+			p = m
+		}
+	}
 	if !s.lib.Allowed(p) { // before touching the filesystem: don't reveal what exists elsewhere
 		writeErr(w, 400, pipeline.ErrNotAllowed)
 		return
@@ -236,6 +243,19 @@ func (s *Server) clearQueue(w http.ResponseWriter, r *http.Request) {
 // hook accepts calls from Tdarr flows, Bazarr post-processing, scripts, ...
 // The file can be given as ?path=..., a form field or JSON: path | file | filePath | episode | subtitles | video.
 func (s *Server) hook(w http.ResponseWriter, r *http.Request) {
+	// Bazarr/Tdarr/curl send no browser headers; a request a web page makes does.
+	if site := r.Header.Get("Sec-Fetch-Site"); site == "cross-site" || site == "same-site" {
+		writeErr(w, http.StatusForbidden, errors.New("cross-site requests are not allowed"))
+		return
+	}
+	if o := r.Header.Get("Origin"); o != "" && !strings.HasSuffix(o, "://"+r.Host) {
+		writeErr(w, http.StatusForbidden, errors.New("cross-site requests are not allowed"))
+		return
+	}
+	if tok := s.cfg.HookToken; tok != "" && r.Header.Get("X-Hook-Token") != tok && r.URL.Query().Get("token") != tok {
+		writeErr(w, http.StatusUnauthorized, errors.New("missing or wrong hook token"))
+		return
+	}
 	keys := []string{"path", "file", "filePath", "episode", "video", "subtitles"}
 	var path string
 	for _, k := range keys {

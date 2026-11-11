@@ -28,6 +28,7 @@ type Local struct {
 	client *http.Client
 
 	dlMu     sync.Mutex   // serialises model downloads
+	reqMu    sync.Mutex   // one request at a time (the server runs one anyway), so timeouts measure real work
 	stopping atomic.Bool  // set while we stop the server on purpose
 	lastExit atomic.Value // string: why the server last exited unexpectedly
 	mu       sync.Mutex
@@ -218,7 +219,8 @@ func (l *Local) launch(ctx context.Context, bin string) error {
 			return ctx.Err()
 		case <-time.After(500 * time.Millisecond):
 		}
-		resp, err := http.Get(l.url("/"))
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, l.url("/"), nil)
+		resp, err := (&http.Client{Timeout: 2 * time.Second}).Do(req)
 		if err == nil {
 			resp.Body.Close()
 			select {
@@ -319,10 +321,12 @@ func (l *Local) Transcribe(ctx context.Context, pcm []byte, language string) (*C
 		l.lastUsed = time.Now()
 		l.mu.Unlock()
 
+		l.reqMu.Lock()
 		rctx, cancel := context.WithTimeout(ctx, timeout)
 		chunk, err := postTranscription(rctx, l.client, l.url("/inference"), nil, fields, pcm, 2)
 		hung := rctx.Err() == context.DeadlineExceeded && ctx.Err() == nil
 		cancel()
+		l.reqMu.Unlock()
 
 		l.mu.Lock()
 		l.inflight--
@@ -340,7 +344,8 @@ func (l *Local) Transcribe(ctx context.Context, pcm []byte, language string) (*C
 			why, _ := l.lastExit.Load().(string)
 			slog.Warn("whisper server died during a request; restarting and retrying", "attempt", attempt+1, "why", why)
 		default:
-			return nil, err // an answer from a healthy server
+			// the server is alive and answered: a problem with this request, not an engine outage
+			return nil, fmt.Errorf("whisper rejected this audio: %v", err)
 		}
 	}
 	why, _ := l.lastExit.Load().(string)

@@ -84,61 +84,95 @@ func percentile(xs []float64, p float64) float64 {
 	return s[int(p*float64(len(s)-1))]
 }
 
+// levels returns the background floor and speech peak around a stretch of audio.
+func (d *Detector) levels(from, to int) (floor, peak float64, ok bool) {
+	if from < 0 {
+		from = 0
+	}
+	if to > len(d.db) {
+		to = len(d.db)
+	}
+	if to-from < 20 {
+		return 0, 0, false
+	}
+	ctx := d.db[from:to]
+	floor, peak = percentile(ctx, 0.15), percentile(ctx, 0.95)
+	return floor, peak, peak-floor >= 8 // no real contrast between speech and background
+}
+
+// fraction of frames in [a, b) at or above level
+func (d *Detector) above(a, b int, level float64) float64 {
+	if a < 0 {
+		a = 0
+	}
+	if b > len(d.db) {
+		b = len(d.db)
+	}
+	if b <= a {
+		return 0
+	}
+	n := 0
+	for k := a; k < b; k++ {
+		if d.db[k] >= level {
+			n++
+		}
+	}
+	return float64(n) / float64(b-a)
+}
+
+// ActiveAtStart reports whether the chunk already opens on sound loud enough to be speech
+// (i.e. it may have been cut mid-sentence).
+func (d *Detector) ActiveAtStart() bool {
+	floor, peak, ok := d.levels(0, len(d.db))
+	if !ok {
+		return false
+	}
+	return d.above(0, 15, floor+0.25*(peak-floor)) >= 0.5
+}
+
 // Refine returns where speech really starts for a segment whisper says starts at t, searching
 // from just before t up to `until` (the next segment's start). ok is false when the audio shows
-// no clear onset there: continuous speech or loud background, or t already inside running speech
-// (then any later onset would belong to a different phrase).
+// no clear, speech-like onset there - continuous speech or loud background, t inside running
+// speech, or speech between t and the candidate (then the candidate belongs to a later phrase).
 func (d *Detector) Refine(t, until float64) (float64, bool) {
 	if until <= t {
 		until = t + 4
 	}
 	until = math.Min(until, t+15) // whisper's start can sit at the previous line's end, long before
 	lo, hi := d.frame(t-0.3), d.frame(until)
-	ctx := d.db[d.frame(t-1.5):hi]
-	if hi-lo < 14 || len(ctx) < 20 {
+	if hi-lo < 14 {
 		return t, false
 	}
-	floor, peak := percentile(ctx, 0.15), percentile(ctx, 0.95)
-	if peak-floor < 8 { // no real contrast between speech and background
+	floor, peak, ok := d.levels(d.frame(t-1.5), hi)
+	if !ok {
 		return t, false
 	}
 	thr := floor + 0.35*(peak-floor)
 	attack := floor + 0.15*(peak-floor)
-
-	// speech-like: 120 ms mostly above the threshold (a click, cough or music hit is shorter)
-	sustained := func(f int) bool {
-		above := 0
-		for k := f; k < f+12; k++ {
-			if d.db[k] >= thr {
-				above++
-			}
-		}
-		return d.db[f] >= thr && above >= 10
-	}
-	// ... coming out of mostly quiet (the previous 150 ms)
-	fromQuiet := func(f int) bool {
-		quiet, n := 0, 0
-		for k := f - 15; k < f; k++ {
-			if k < 0 {
-				continue
-			}
-			n++
-			if d.db[k] < thr {
-				quiet++
-			}
-		}
-		return n >= 10 && float64(quiet) >= 0.8*float64(n)
-	}
 	ft := d.frame(t)
-	inSpeech := ft+12 < len(d.db) && sustained(ft)
+
+	// t is inside speech only if speech keeps going after it (not just the previous line's tail)
+	inSpeech := d.above(ft, ft+40, attack) >= 0.7
 
 	for f := lo; f+12 < hi; f++ {
-		if !sustained(f) || !fromQuiet(f) {
+		// candidate: 120 ms mostly loud, coming out of mostly quiet (the previous 150 ms)
+		if d.db[f] < thr || d.above(f, f+12, thr) < 0.83 || d.above(f-15, f, thr) > 0.2 || f < 10 {
 			continue
 		}
-		if inSpeech && float64(f)*frameSec > t+0.1 {
-			// t is inside speech that started before our search: the onset we'd report is the
-			// next phrase, not this one
+		far := float64(f)*frameSec > t+4
+		// speech-like: followed by sustained energy (400 ms, or 600 ms when far from whisper's start),
+		// so a door slam, laugh or music hit is not taken for the line
+		need := 40
+		if far {
+			need = 60
+		}
+		if d.above(f, f+need, attack) < 0.75 {
+			continue
+		}
+		after := float64(f)*frameSec > t+0.1
+		if after && (inSpeech || d.above(ft+10, f-15, attack) > 0.3) {
+			// t sits in running speech, or there is speech between t and this onset: the onset
+			// belongs to a later phrase, not to this segment
 			return t, false
 		}
 		// back up to where the attack began - at most 100 ms, never through a gap into the

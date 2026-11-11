@@ -302,3 +302,39 @@ func TestReviewZeroMinAnchorsDoesNotPanic(t *testing.T) {
 		t.Fatal("mapping from nothing")
 	}
 }
+
+// round 2: a transcript biased early (music/titles) in the opening must not rewrite a correct cold open
+func TestReviewBiasedOpeningNotRewritten(t *testing.T) {
+	for seed := int64(1); seed <= 20; seed++ {
+		sc := &scene{cues: 420, yield: 0.3, noise: 0.2, outliers: 0.15, seed: seed,
+			subOf: func(a float64) float64 { return a + 1.0 }}
+		cues, words := sc.build()
+		for i := range words { // whisper starts 1.5 s early during the first 200 s
+			if words[i].Start < 200 {
+				words[i].Start -= 1.5
+			}
+		}
+		dur := sc.truth[len(sc.truth)-1] + 30
+		sort.Slice(cues, func(i, j int) bool { return cues[i].Start < cues[j].Start })
+		r := Analyze(cues, words, nil, [][2]float64{{0, dur}}, dur, DefaultParams(), false)
+		checkRegion(t, "biased opening", sc, r, func(a float64) bool { return a < 200 }, 0.3, 0.9)
+	}
+}
+
+// round 2: a 15-minute stretch of biased transcript (A-B-A) is not written as a 3-section fix
+func TestReviewLongExcursionIsNotWritten(t *testing.T) {
+	for seed := int64(1); seed <= 20; seed++ {
+		sc := &scene{cues: 900, yield: 0.3, noise: 0.2, outliers: 0.15, seed: seed,
+			subOf: func(a float64) float64 { return a + 1.0 }}
+		cues, words := sc.build()
+		for i := range words {
+			if words[i].Start > 2000 && words[i].Start < 2900 {
+				words[i].Start -= 1.5
+			}
+		}
+		dur := sc.truth[len(sc.truth)-1] + 30
+		sort.Slice(cues, func(i, j int) bool { return cues[i].Start < cues[j].Start })
+		r := Analyze(cues, words, nil, [][2]float64{{0, dur}}, dur, DefaultParams(), false)
+		checkRegion(t, "long excursion", sc, r, func(a float64) bool { return a > 2000 && a < 2900 }, 0.3, 0.9)
+	}
+}

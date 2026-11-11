@@ -130,8 +130,23 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
-	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_files_queue ON files(status, priority DESC, queued_at, id)`)
-	return err
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_files_queue ON files(status, priority DESC, queued_at, id)`); err != nil {
+		return err
+	}
+	var ver int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		return err
+	}
+	if ver < 2 {
+		// v2: 'attempts' now counts consecutive unfinished claims; older versions counted every run
+		if _, err := db.Exec(`UPDATE files SET attempts=0 WHERE status != 'processing'`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -209,7 +224,8 @@ func (s *Store) ClaimNext() (*File, error) {
 		var id int64
 		var path, reason string
 		var attempts int
-		err := s.db.QueryRow(`SELECT id, path, reason, attempts FROM files WHERE status=? ORDER BY priority DESC, queued_at, id LIMIT 1`, Queued).
+		err := s.db.QueryRow(`SELECT id, path, reason, attempts FROM files WHERE status=? AND queued_at <= ?
+			ORDER BY priority DESC, queued_at, id LIMIT 1`, Queued, now()).
 			Scan(&id, &path, &reason, &attempts)
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -258,17 +274,17 @@ func (s *Store) Finish(id int64, status, message, signature string, offsetMs *in
 	return nil
 }
 
-// Requeue puts a file that is being processed back in the queue (same priority, same place).
-// countAttempt=false when it was not the file's fault (e.g. the engine was down).
-func (s *Store) Requeue(id int64, message string, countAttempt bool) error {
+// Requeue puts a file that is being processed back in the queue, behind the other files of its
+// priority, not to be picked up for `delay`. countAttempt=false when it was not the file's fault.
+func (s *Store) Requeue(id int64, message string, countAttempt bool, delay time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	dec := 1
 	if countAttempt {
 		dec = 0
 	}
-	res, err := s.db.Exec(`UPDATE files SET status=?, message=?, attempts=MAX(0, attempts-?), updated_at=? WHERE id=? AND status=?`,
-		Queued, message, dec, now(), id, Processing)
+	res, err := s.db.Exec(`UPDATE files SET status=?, message=?, attempts=MAX(0, attempts-?), queued_at=?, updated_at=? WHERE id=? AND status=?`,
+		Queued, message, dec, now()+delay.Seconds(), now(), id, Processing)
 	if err != nil {
 		return err
 	}

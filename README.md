@@ -113,6 +113,8 @@ curl -s -X POST "http://UNRAID-IP:8080/api/hooks/bazarr" --data-urlencode "path=
 ```
 If Bazarr sees the library under a different path (e.g. `/tv`), add `PATH_MAPPINGS=/tv:/media/tv,/movies:/media/movies`.
 
+If you set `HOOK_TOKEN`, add `-H "X-Hook-Token: <token>"` to that command.
+
 If you use this, turn **off** Bazarr's own *automatic subtitle synchronization*, so the two don't both adjust the same file.
 
 ### Tdarr / anything else
@@ -151,11 +153,12 @@ If you use this, turn **off** Bazarr's own *automatic subtitle synchronization*,
 | `SCAN_ON_START` | `false` | Sweep once at startup |
 | `IGNORE_PATTERNS` | `*TdarrCache*,*.partial*,*.tmp,*-sample.*,*.sample.*,.*` | Glob patterns for names to skip |
 | `PATH_MAPPINGS` | | `from:to,...` for paths coming in via hooks |
+| `HOOK_TOKEN` | | Optional secret: hooks must then send it as `X-Hook-Token` header or `?token=` |
 | `PUID` / `PGID` / `UMASK` | `99` / `100` / `002` | File ownership of rewritten subtitles |
 
 ## Statuses
 
-`fixed` timestamps rewritten · `in_sync` checked, no change needed · `needs_fix` (dry run) would be fixed · `uncertain` couldn't decide confidently, left untouched · `embedded` only embedded subtitles, not checked (`EMBEDDED_SUBS=report`) · `no_subs` no subtitles (or only image-based ones) · `failed` error (see details) · `missing` file gone.
+`fixed` timestamps rewritten · `in_sync` checked, no change needed · `needs_fix` (dry run) would be fixed · `uncertain` couldn't decide confidently, left untouched · `uncertain` also covers: timing differs between parts of the file in a way the evidence can't settle, or two videos in one folder share a name · `embedded` only embedded subtitles, not checked (`EMBEDDED_SUBS=report`) · `no_subs` no subtitles (or only image-based ones) · `failed` error (see details) · `missing` file gone.
 
 ## Undo
 Originals are saved under `/config/backups/<date>/<original path>.<time>`. Copy one back to restore it.
