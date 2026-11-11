@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,6 +30,7 @@ type Service struct {
 	lastOK     atomic.Int64  // unix nanos of the last job the engine got through
 	lastOKID   atomic.Int64  // ...and which file that was
 	engFails   map[int64]int // consecutive engine failures per file (guarded by mu)
+	recent     []jobStat     // last finished jobs, for throughput/ETA (guarded by mu)
 	wg         sync.WaitGroup
 
 	mu      sync.Mutex
@@ -150,7 +152,7 @@ func (s *Service) handle(ctx context.Context, wid int, f *store.File) {
 					Signature: s.lib.Signature(f.Path)}
 			}
 		}()
-		out = s.proc.Process(ctx, f.Path, progress)
+		out = s.proc.Process(ctx, f.Path, f.Reason, progress)
 	}()
 	if ctx.Err() != nil {
 		return // shutting down: leave it 'processing' so it is re-queued on start
@@ -164,6 +166,7 @@ func (s *Service) handle(ctx context.Context, wid int, f *store.File) {
 		s.lastOK.Store(time.Now().UnixNano())
 		s.lastOKID.Store(f.ID)
 	}
+	s.record(cur.Started, out)
 	s.mu.Lock()
 	delete(s.engFails, f.ID)
 	s.mu.Unlock()
@@ -208,6 +211,94 @@ func (s *Service) requeue(f *store.File, out Outcome) {
 		slog.Error("requeue", "err", err)
 	}
 	slog.Info("requeued", "path", f.Path, "why", out.Message, "counted", countAttempt)
+}
+
+type jobStat struct {
+	done             time.Time
+	took             float64
+	listened         bool // needed the speech model (not just "no subtitles" etc.)
+	whisperS, audioS float64
+	full, extra      bool
+}
+
+func (s *Service) record(started time.Time, out Outcome) {
+	st := jobStat{done: time.Now(), took: time.Since(started).Seconds()}
+	if tm, ok := out.Details["timing"].(map[string]any); ok {
+		st.listened = true
+		st.whisperS, _ = tm["whisper_s"].(float64)
+		st.audioS, _ = tm["audio_s"].(float64)
+		if ps, ok := tm["passes"].([]string); ok {
+			for _, p := range ps {
+				st.full = st.full || p == "chunk"
+				st.extra = st.extra || p == "extra sample"
+			}
+		}
+	}
+	s.mu.Lock()
+	s.recent = append(s.recent, st)
+	if len(s.recent) > 300 {
+		s.recent = s.recent[len(s.recent)-300:]
+	}
+	s.mu.Unlock()
+}
+
+// Perf summarises recent throughput: files/hour over the last hour, average time per analysed
+// file, how often the extra/full passes were needed, how fast whisper ran, and an ETA.
+func (s *Service) Perf(queued int) map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var lastHour, listened, full, extra int
+	var took, whisperS, audioS float64
+	for _, j := range s.recent {
+		if time.Since(j.done) < time.Hour {
+			lastHour++
+		}
+		if j.listened {
+			listened++
+			took += j.took
+			whisperS += j.whisperS
+			audioS += j.audioS
+			if j.full {
+				full++
+			}
+			if j.extra {
+				extra++
+			}
+		}
+	}
+	out := map[string]any{"files_last_hour": lastHour, "sample_size": listened}
+	if listened > 0 {
+		out["avg_s_per_file"] = math.Round(took / float64(listened))
+		out["full_pass_pct"] = math.Round(100 * float64(full) / float64(listened))
+		out["extra_pass_pct"] = math.Round(100 * float64(extra) / float64(listened))
+	}
+	if whisperS > 0 {
+		out["whisper_realtime_x"] = math.Round(audioS/whisperS*10) / 10
+	}
+	// rate from the recent window (up to the last hour), so it reflects current settings
+	if n := len(s.recent); n >= 3 {
+		first := s.recent[0].done
+		for _, j := range s.recent {
+			if time.Since(j.done) < time.Hour {
+				first = j.done
+				break
+			}
+		}
+		cnt := 0
+		for _, j := range s.recent {
+			if !j.done.Before(first) {
+				cnt++
+			}
+		}
+		if span := time.Since(first).Hours(); span > 0.02 && cnt > 1 {
+			rate := float64(cnt) / span
+			out["files_per_hour"] = math.Round(rate)
+			if queued > 0 {
+				out["eta_hours"] = math.Round(float64(queued)/rate*10) / 10
+			}
+		}
+	}
+	return out
 }
 
 func (s *Service) Pause(p bool) { s.paused.Store(p) }

@@ -100,7 +100,7 @@ dialog .bd{padding:14px 16px;max-height:70vh;overflow:auto}
           <button id="goFixed" title="Measure already-fixed files against the audio again and correct them further if needed">Re-check “fixed”</button>
         </div>
         <div class="row">
-          <button id="goUncertain">Retry uncertain</button>
+          <button id="goUncertain" title="Whole film with the stronger THOROUGH_MODEL - slower, finds more matches">Thorough re-check “uncertain”</button>
           <button id="goFailed">Retry failed</button>
           <button id="goNeedsFix" title="Files flagged during a dry run">Re-run “needs fix”</button>
           <button id="goEmbedded" title="Videos whose only subtitles are embedded (after setting EMBEDDED_SUBS=remux or sidecar)">Re-check embedded-only</button>
@@ -110,6 +110,8 @@ dialog .bd{padding:14px 16px;max-height:70vh;overflow:auto}
 
     <section class="card">
       <h2>Activity</h2>
+      <div id="perf" class="small muted" style="margin-bottom:8px"></div>
+      <div id="reasons" class="small" style="margin-bottom:8px"></div>
       <div id="current" class="small"></div>
       <div id="scans" class="small" style="margin-top:8px"></div>
       <div class="row" style="margin-top:10px;justify-content:space-between">
@@ -173,7 +175,24 @@ async function refreshStatus(){
   if($("#fStatus").options.length===1) order.forEach(k=>$("#fStatus").add(new Option(LABELS[k]||k,k)));
 
   const e = s.engine;
-  $("#engine").innerHTML = `<span class="dot ${e.loaded||e.engine==="openai"?"on":""}"></span> ${esc(e.engine)} · ${esc(e.model)}${e.device?" · "+esc(e.device):""}${s.settings.dry_run?" · <b>DRY RUN</b>":""} · embedded: ${esc(s.settings.embedded_subs)}`;
+  const pf = s.perf||{};
+  const fmtH = h => h==null ? "" : h<1 ? Math.round(h*60)+" min" : h<48 ? h.toFixed(1)+" h" : (h/24).toFixed(1)+" days";
+  $("#perf").innerHTML = pf.files_per_hour!=null ? [
+      `<b>${pf.files_per_hour}</b> files/hour`,
+      pf.eta_hours!=null ? `ETA ${fmtH(pf.eta_hours)}` : "",
+      pf.avg_s_per_file!=null ? `${pf.avg_s_per_file}s per analysed file` : "",
+      pf.extra_pass_pct ? `${pf.extra_pass_pct}% needed extra samples` : "",
+      pf.full_pass_pct ? `${pf.full_pass_pct}% a full pass` : "",
+      pf.whisper_realtime_x ? `whisper ${pf.whisper_realtime_x}× realtime` : ""].filter(Boolean).join(" · ")
+    : "Throughput appears after a few files.";
+  const RS = {few_matches:"too few lines matched the speech", parts_disagree:"timing differs between parts of the file",
+    needs_full:"needs a full pass", no_match:"subtitle text doesn't match the speech (other language?)",
+    activity_ambiguous:"other language, timing ambiguous", shared_name:"two videos share a name",
+    too_short:"subtitle too short", other:"other"};
+  const ur = s.uncertain_reasons||{};
+  $("#reasons").innerHTML = Object.keys(ur).length ? "<span class='muted'>Uncertain because:</span> " +
+    Object.entries(ur).sort((a,b)=>b[1]-a[1]).map(([k,n])=>`<span class="chip s-uncertain">${n} · ${esc(RS[k]||k)}</span>`).join(" ") : "";
+  $("#engine").innerHTML = `<span class="dot ${e.loaded||e.engine==="openai"?"on":""}"></span> ${esc(e.engine)} · ${esc(e.model)}${e.instances>1?" ×"+e.instances:""}${e.device?" · "+esc(e.device):""}${s.settings.dry_run?" · <b>DRY RUN</b>":""} · embedded: ${esc(s.settings.embedded_subs)}`;
   $("#pauseBtn").textContent = s.paused ? "Resume" : "Pause";
   $("#pauseBtn").dataset.paused = s.paused;
 
@@ -219,14 +238,17 @@ async function showDetail(id){
       ${d.analysis?`<span class="muted">Analysis</span><span>${esc(d.analysis)} · ${d.audio_analysed_s}s of audio · language ${esc(d.audio_language||"?")} · took ${d.elapsed_s}s</span>`:""}
       <span class="muted">Attempts</span><span>${f.attempts}</span></div>
     ${tracks}
-    <div class="row" style="margin-top:12px"><button id="recheckBtn" data-p="${esc(f.path)}">Re-check this file</button></div>
+    <div class="row" style="margin-top:12px"><button id="recheckBtn" data-p="${esc(f.path)}">Re-check this file</button>
+      <button id="thoroughBtn" data-p="${esc(f.path)}" title="Whole film with the stronger THOROUGH_MODEL">Thorough re-check</button></div>
+    ${d.timing?`<div class="small muted" style="margin-top:6px">Took ${d.timing.total_s}s: audio decode ${d.timing.decode_s}s, whisper ${d.timing.whisper_s}s for ${d.timing.audio_s}s of audio (${d.timing.realtime_x}× realtime) · passes: ${esc((d.timing.passes||[]).join(", "))}${d.thorough?" · thorough":""}</div>`:""}
     <h2 style="font-size:12px;color:var(--muted);margin:16px 0 6px">HISTORY</h2>
     <table class="small">${r.history.map(h=>`<tr><td class="muted">${new Date(h.ts*1000).toLocaleString()}</td><td><span class="chip s-${h.status}">${LABELS[h.status]||h.status}</span></td><td>${esc(h.message)}</td></tr>`).join("")}</table>`;
   $("#recheckBtn").onclick = e => reprocess(e.currentTarget.dataset.p);
+  $("#thoroughBtn").onclick = e => reprocess(e.currentTarget.dataset.p, true);
   $("#detail").showModal();
 }
 function fmtT(s){ s=Math.max(0,s); const h=Math.floor(s/3600), m=Math.floor(s%3600/60), x=Math.floor(s%60); return `${h}:${String(m).padStart(2,"0")}:${String(x).padStart(2,"0")}`; }
-async function reprocess(path){ try{ const r = await post("/api/process",{path,force:true}); toast("Queued: "+r.result); detail.close(); tick(); }catch(e){ toast(e.message); } }
+async function reprocess(path, thorough){ try{ const r = await post("/api/process",{path,force:true,thorough:!!thorough}); toast((thorough?"Thorough re-check queued: ":"Queued: ")+r.result); detail.close(); tick(); }catch(e){ toast(e.message); } }
 
 async function browse(path){
   try{
@@ -254,7 +276,7 @@ $("#goAll").onclick = async () => { try{ await post("/api/process/all",{force:$(
 const recheck = (statuses,msg) => async () => { try{ await post("/api/process/status",{statuses}); toast(msg); tick(); }catch(e){ toast(e.message); } };
 $("#goInSync").onclick = recheck(["in_sync"], "Re-checking files marked in sync…");
 $("#goFixed").onclick = recheck(["fixed"], "Re-checking fixed files…");
-$("#goUncertain").onclick = recheck(["uncertain"], "Retrying uncertain files…");
+$("#goUncertain").onclick = async () => { try{ await post("/api/process/status",{statuses:["uncertain"], thorough:true}); toast("Thorough re-check of uncertain files queued…"); tick(); }catch(e){ toast(e.message); } };
 $("#goFailed").onclick = recheck(["failed"], "Retrying failed files…");
 $("#goNeedsFix").onclick = recheck(["needs_fix"], "Re-running files flagged by dry run…");
 $("#goEmbedded").onclick = recheck(["embedded"], "Re-checking embedded-only files…");

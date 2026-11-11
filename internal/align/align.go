@@ -202,7 +202,8 @@ func DefaultParams() Params {
 }
 
 type Result struct {
-	Status        string   `json:"status"` // in_sync | needs_fix | uncertain
+	Status        string   `json:"status"`           // in_sync | needs_fix | uncertain
+	Reason        string   `json:"reason,omitempty"` // why uncertain: few_matches | parts_disagree | no_match | activity_ambiguous
 	Message       string   `json:"message"`
 	Mapping       *Mapping `json:"mapping,omitempty"`
 	Cues          int      `json:"cues"`
@@ -1090,7 +1091,7 @@ func Analyze(cues []Cue, words []Word, speech, spans [][2]float64, duration floa
 	}
 	r.Anchors = nAnchors
 	if m != nil && weak(m, p) {
-		r.Status = "uncertain"
+		r.Status, r.Reason = "uncertain", "few_matches"
 		r.Mapping = m
 		r.Message = "Not enough reliable matches to act on (" + itoa(int64(m.AnchorsUsed)) + " consistent of " +
 			itoa(int64(nAnchors)) + " matched lines), left unchanged"
@@ -1098,7 +1099,7 @@ func Analyze(cues []Cue, words []Word, speech, spans [][2]float64, duration floa
 		return r
 	}
 	if m != nil && m.Contradicted {
-		r.Status = "uncertain"
+		r.Status, r.Reason = "uncertain", "parts_disagree"
 		r.Mapping = m
 		r.Message = "Timing differs between parts of the file (" + itoa(int64(m.Disagreeing)) +
 			" matched lines disagree with the best fit), left unchanged"
@@ -1119,7 +1120,7 @@ func Analyze(cues []Cue, words []Word, speech, spans [][2]float64, duration floa
 			// one global offset only: refuse when the two halves of the film disagree
 			if a, b, okA, okB := halves(cues, speech, spans, duration, p.MaxOffset); (okA && a == nil) || (okB && b == nil) ||
 				(a != nil && b != nil && math.Abs(a.Pieces[0].Offset-b.Pieces[0].Offset) > 0.5) {
-				r.Status = "uncertain"
+				r.Status, r.Reason = "uncertain", "activity_ambiguous"
 				r.Message = "Subtitle text did not match the speech, and speech activity suggests different " +
 					"offsets in each half of the film; left unchanged"
 				r.WantsFull = sampled
@@ -1131,7 +1132,7 @@ func Analyze(cues []Cue, words []Word, speech, spans [][2]float64, duration floa
 			return r
 		}
 	}
-	r.Status = "uncertain"
+	r.Status, r.Reason = "uncertain", "no_match"
 	r.Message = "Could not determine timing (" + itoa(int64(nAnchors)) + " text matches)"
 	r.WantsFull = sampled
 	return r

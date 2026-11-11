@@ -495,3 +495,22 @@ func (s *Store) List(status, q string, limit, offset int) ([]*File, int, error) 
 	}
 	return out, total, rows.Err()
 }
+
+// UncertainReasons counts uncertain files by why they are uncertain.
+func (s *Store) UncertainReasons() map[string]int {
+	out := map[string]int{}
+	rows, err := s.db.Query(`SELECT COALESCE(json_extract(details, '$.reason'), 'other'), COUNT(*) FROM files
+		WHERE status=? GROUP BY 1`, Uncertain)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r string
+		var n int
+		if rows.Scan(&r, &n) == nil {
+			out[r] = n
+		}
+	}
+	return out
+}

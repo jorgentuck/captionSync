@@ -22,12 +22,13 @@ import (
 
 const modelBaseURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
 
-// Local manages a whisper.cpp server subprocess.
-type Local struct {
+// server manages one whisper.cpp server subprocess for one model on one port.
+type server struct {
 	cfg    *config.Config
 	client *http.Client
+	model  string
+	port   int
 
-	dlMu     sync.Mutex   // serialises model downloads
 	reqMu    sync.Mutex   // one request at a time (the server runs one anyway), so timeouts measure real work
 	stopping atomic.Bool  // set while we stop the server on purpose
 	lastExit atomic.Value // string: why the server last exited unexpectedly
@@ -39,41 +40,37 @@ type Local struct {
 	inflight int
 }
 
-func NewLocal(cfg *config.Config) *Local {
-	l := &Local{cfg: cfg, client: &http.Client{Timeout: 3 * time.Hour}} // per-request deadlines come from ctx
+func newServer(cfg *config.Config, model string, port int) *server {
+	l := &server{cfg: cfg, model: model, port: port,
+		client: &http.Client{Timeout: 3 * time.Hour}} // per-request deadlines come from ctx
 	go l.reaper()
 	return l
 }
 
-func (l *Local) Name() string { return "local" }
-
-func (l *Local) modelPath() string {
-	m := l.cfg.WhisperModel
+func modelPath(cfg *config.Config, m string) string {
 	if strings.HasSuffix(m, ".bin") {
 		return m
 	}
-	return filepath.Join(l.cfg.ConfigDir, "models", "ggml-"+m+".bin")
+	return filepath.Join(cfg.ConfigDir, "models", "ggml-"+m+".bin")
 }
+
+func (l *server) modelPath() string { return modelPath(l.cfg, l.model) }
 
 const vadBaseURL = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/"
 
-func (l *Local) vadPath() string {
-	m := l.cfg.WhisperVADModel
-	if strings.HasSuffix(m, ".bin") {
-		return m
-	}
-	return filepath.Join(l.cfg.ConfigDir, "models", "ggml-"+m+".bin")
-}
+func (l *server) vadPath() string { return modelPath(l.cfg, l.cfg.WhisperVADModel) }
 
-// EnsureModel downloads the speech model (and VAD model) on first use. Safe to call concurrently.
-func (l *Local) EnsureModel(ctx context.Context) error {
-	l.dlMu.Lock()
-	defer l.dlMu.Unlock()
-	if err := download(ctx, l.modelPath(), modelBaseURL+"ggml-"+l.cfg.WhisperModel+".bin", l.cfg.WhisperModel); err != nil {
+var dlMu sync.Mutex // serialises model downloads across all servers
+
+// ensureModel downloads a speech model (and the VAD model) on first use. Safe to call concurrently.
+func ensureModel(ctx context.Context, cfg *config.Config, model string) error {
+	dlMu.Lock()
+	defer dlMu.Unlock()
+	if err := download(ctx, modelPath(cfg, model), modelBaseURL+"ggml-"+model+".bin", model); err != nil {
 		return err
 	}
-	if l.cfg.WhisperVAD {
-		return download(ctx, l.vadPath(), vadBaseURL+"ggml-"+l.cfg.WhisperVADModel+".bin", l.cfg.WhisperVADModel)
+	if cfg.WhisperVAD {
+		return download(ctx, modelPath(cfg, cfg.WhisperVADModel), vadBaseURL+"ggml-"+cfg.WhisperVADModel+".bin", cfg.WhisperVADModel)
 	}
 	return nil
 }
@@ -123,16 +120,16 @@ func gpuPresent() bool {
 	return false
 }
 
-func (l *Local) binary(device string) string {
+func (l *server) binary(device string) string {
 	return filepath.Join(l.cfg.WhisperBinDir, "whisper-server-"+device)
 }
 
-func (l *Local) url(path string) string {
-	return "http://127.0.0.1:" + strconv.Itoa(l.cfg.WhisperPort) + path
+func (l *server) url(path string) string {
+	return "http://127.0.0.1:" + strconv.Itoa(l.port) + path
 }
 
 // start launches the server; caller holds l.mu.
-func (l *Local) start(ctx context.Context) error {
+func (l *server) start(ctx context.Context) error {
 	if l.cmd != nil {
 		select {
 		case <-l.exited:
@@ -141,7 +138,7 @@ func (l *Local) start(ctx context.Context) error {
 			return nil
 		}
 	}
-	if err := l.EnsureModel(ctx); err != nil {
+	if err := ensureModel(ctx, l.cfg, l.model); err != nil {
 		return err
 	}
 	var devices []string
@@ -169,16 +166,21 @@ func (l *Local) start(ctx context.Context) error {
 			continue
 		}
 		l.device = dev
-		slog.Info("whisper server ready", "device", dev, "model", l.cfg.WhisperModel)
+		slog.Info("whisper server ready", "device", dev, "model", l.model, "port", l.port)
 		return nil
 	}
 	return fmt.Errorf("could not start whisper server: %w", lastErr)
 }
 
-func (l *Local) launch(ctx context.Context, bin string) error {
-	args := []string{"-m", l.modelPath(), "--host", "127.0.0.1", "--port", strconv.Itoa(l.cfg.WhisperPort),
+func (l *server) launch(ctx context.Context, bin string) error {
+	args := []string{"-m", l.modelPath(), "--host", "127.0.0.1", "--port", strconv.Itoa(l.port),
 		"-t", strconv.Itoa(l.cfg.WhisperThreads),
-		"-nc", // never carry context from one request (another file / window) into the next
+		"-nc",      // never carry context from one request (another file / window) into the next
+		"-nf",      // no temperature fallback: re-decoding music/noise is slow and useless for timing
+		"-bo", "1", // greedy: one candidate
+	}
+	if l.cfg.WhisperFlashAttn {
+		args = append(args, "-fa")
 	}
 	if l.cfg.WhisperVAD {
 		// Optional. Measured on whisper.cpp 1.7.6: VAD timestamps are sometimes perfect and
@@ -186,8 +188,8 @@ func (l *Local) launch(ctx context.Context, bin string) error {
 		args = append(args, "--vad", "-vm", l.vadPath())
 	}
 	// make sure the port is ours: otherwise the readiness probe could talk to someone else
-	if ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(l.cfg.WhisperPort)); err != nil {
-		return fmt.Errorf("port %d is already in use (set WHISPER_PORT to a free port): %w", l.cfg.WhisperPort, err)
+	if ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(l.port)); err != nil {
+		return fmt.Errorf("port %d is already in use (set WHISPER_PORT to a free range): %w", l.port, err)
 	} else {
 		ln.Close()
 	}
@@ -238,7 +240,7 @@ func (l *Local) launch(ctx context.Context, bin string) error {
 	return fmt.Errorf("timed out waiting for whisper server")
 }
 
-func (l *Local) stop() {
+func (l *server) stop() {
 	if l.cmd == nil {
 		return
 	}
@@ -254,7 +256,7 @@ func (l *Local) stop() {
 	slog.Info("whisper server stopped (GPU memory released)")
 }
 
-func (l *Local) reaper() {
+func (l *server) reaper() {
 	for range time.Tick(15 * time.Second) {
 		l.mu.Lock()
 		if l.cmd != nil && l.inflight == 0 && l.cfg.ModelIdleUnload > 0 && time.Since(l.lastUsed) > l.cfg.ModelIdleUnload {
@@ -265,7 +267,7 @@ func (l *Local) reaper() {
 }
 
 // crashed reports whether the running server process has died.
-func (l *Local) crashed() bool {
+func (l *server) crashed() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.cmd == nil {
@@ -280,7 +282,7 @@ func (l *Local) crashed() bool {
 }
 
 // kill forcibly ends a hung server; the next request starts a fresh one.
-func (l *Local) kill() {
+func (l *server) kill() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.cmd == nil {
@@ -295,7 +297,7 @@ func (l *Local) kill() {
 // Transcribe sends one chunk to the server. If the server dies (out of GPU memory, a whisper.cpp
 // crash) or hangs, it is restarted and the chunk retried, so one bad moment doesn't fail the file.
 // Failures of the server itself are reported as ErrEngine.
-func (l *Local) Transcribe(ctx context.Context, pcm []byte, language string) (*Chunk, error) {
+func (l *server) Transcribe(ctx context.Context, pcm []byte, language string) (*Chunk, error) {
 	if language == "" {
 		language = "auto"
 	}
@@ -352,16 +354,16 @@ func (l *Local) Transcribe(ctx context.Context, pcm []byte, language string) (*C
 	return nil, fmt.Errorf("%w: whisper server keeps failing (%v). Server said: %s", ErrEngine, lastErr, why)
 }
 
-// Status never blocks: while the model downloads or the server starts, it says so.
-func (l *Local) Status() map[string]any {
+// state never blocks: while the model downloads or the server starts, it says so.
+func (l *server) state() (loaded bool, device string) {
 	if !l.mu.TryLock() {
-		return map[string]any{"engine": "local", "model": l.cfg.WhisperModel, "loaded": false, "device": "starting"}
+		return false, "starting"
 	}
 	defer l.mu.Unlock()
-	return map[string]any{"engine": "local", "model": l.cfg.WhisperModel, "loaded": l.cmd != nil, "device": l.device}
+	return l.cmd != nil, l.device
 }
 
-func (l *Local) Close() {
+func (l *server) Close() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.stop()
@@ -393,3 +395,115 @@ func (p *prefixWriter) tail() string {
 	defer p.mu.Unlock()
 	return strings.Join(p.buf, " | ")
 }
+
+// ---------------------------------------------------------------------------
+// Local: pools of servers. Requests borrow a free server, so WHISPER_INSTANCES servers transcribe
+// in parallel (the GPU is far from saturated by one). An optional THOROUGH_MODEL gets one server
+// of its own, used only for files re-checked in thorough mode.
+// ---------------------------------------------------------------------------
+
+type pool struct {
+	servers []*server
+	free    chan *server
+}
+
+type Local struct {
+	cfg   *config.Config
+	mu    sync.Mutex
+	pools map[string]*pool
+}
+
+func NewLocal(cfg *config.Config) *Local { return &Local{cfg: cfg, pools: map[string]*pool{}} }
+
+func (l *Local) Name() string { return "local" }
+
+func (l *Local) pool(model string) *pool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if p, ok := l.pools[model]; ok {
+		return p
+	}
+	n, port := l.cfg.WhisperInstances, l.cfg.WhisperPort
+	if model != l.cfg.WhisperModel {
+		n, port = 1, l.cfg.WhisperPort+20
+	}
+	p := &pool{free: make(chan *server, n)}
+	for i := 0; i < n; i++ {
+		s := newServer(l.cfg, model, port+i)
+		p.servers = append(p.servers, s)
+		p.free <- s
+	}
+	l.pools[model] = p
+	return p
+}
+
+// EnsureModel fetches the main model up front so the first job doesn't wait for the download.
+func (l *Local) EnsureModel(ctx context.Context) error {
+	return ensureModel(ctx, l.cfg, l.cfg.WhisperModel)
+}
+
+func (l *Local) Transcribe(ctx context.Context, pcm []byte, language string) (*Chunk, error) {
+	return l.transcribeWith(ctx, l.cfg.WhisperModel, pcm, language)
+}
+
+func (l *Local) transcribeWith(ctx context.Context, model string, pcm []byte, language string) (*Chunk, error) {
+	p := l.pool(model)
+	select {
+	case s := <-p.free:
+		defer func() { p.free <- s }()
+		return s.Transcribe(ctx, pcm, language)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// Thorough returns an engine using THOROUGH_MODEL (or this one, if none is configured).
+func (l *Local) Thorough() Engine {
+	if l.cfg.ThoroughModel == "" || l.cfg.ThoroughModel == l.cfg.WhisperModel {
+		return l
+	}
+	return &modelView{l: l, model: l.cfg.ThoroughModel}
+}
+
+func (l *Local) Status() map[string]any {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	loaded, device, servers := 0, "", 0
+	for _, p := range l.pools {
+		for _, s := range p.servers {
+			servers++
+			if ok, d := s.state(); ok || d == "starting" {
+				if ok {
+					loaded++
+				}
+				device = d
+			}
+		}
+	}
+	return map[string]any{"engine": "local", "model": l.cfg.WhisperModel, "thorough_model": l.cfg.ThoroughModel,
+		"instances": l.cfg.WhisperInstances, "loaded": loaded > 0, "running": loaded, "device": device}
+}
+
+func (l *Local) Close() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, p := range l.pools {
+		for _, s := range p.servers {
+			s.Close()
+		}
+	}
+}
+
+// modelView is the Local engine pinned to another model (thorough re-checks).
+type modelView struct {
+	l     *Local
+	model string
+}
+
+func (m *modelView) Name() string { return "local" }
+func (m *modelView) Transcribe(ctx context.Context, pcm []byte, language string) (*Chunk, error) {
+	return m.l.transcribeWith(ctx, m.model, pcm, language)
+}
+func (m *modelView) Status() map[string]any { return m.l.Status() }
+func (m *modelView) Close()                 {}
+func (m *modelView) Thorough() Engine       { return m }

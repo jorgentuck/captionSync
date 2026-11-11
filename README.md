@@ -35,7 +35,9 @@ Every video is recorded in a SQLite database together with a signature of the vi
 ## Performance (1000+ videos, 8 GB GPU)
 
 * **Go + whisper.cpp**: one static Go binary drives a C++/CUDA whisper server. No Python.
-* **Sampled listening**: by default it transcribes only 12 × 60 s windows spread across each video, not the whole file. If the result is unclear, or the offset changes partway through, it automatically does a full pass for that file only.
+* **Sampled listening**: by default it transcribes only 12 × 60 s windows spread across each video. If that isn't conclusive it listens to 36 more windows in between, and only if that still isn't enough does it transcribe the whole film.
+* **Parallel whisper servers** (`WHISPER_INSTANCES`, default 2) keep the GPU busy; whisper's slow "temperature fallback" re-decoding is switched off.
+* The Activity panel shows **files/hour, ETA** and where the time goes.
 * **Small VRAM footprint**: the default `small-q5_1` model uses well under 1 GB of VRAM. The whisper server **shuts down after 5 idle minutes** (`MODEL_IDLE_UNLOAD`), so the GPU is fully released for Tdarr and Plex.
 * **Overlap**: ffmpeg decodes the next audio window while the GPU transcribes the current one, and `WORKERS` files run in parallel.
 
@@ -86,7 +88,8 @@ Plain Docker / Compose: see `docker-compose.yml`. To build the image yourself: `
 * **Process all new / changed**: walks every media root and queues videos that are new or whose video/subtitle files changed since they were last handled.
 * **Re-check "in sync"**: re-processes the files previously judged to need no change.
 * **Re-check "fixed"**: measures already-fixed files against the audio again and corrects them further if needed. Useful after an update that improves accuracy.
-* **Retry uncertain / failed**, and **Re-run "needs fix"** (after a dry run).
+* **Thorough re-check "uncertain"**: listens to the whole film with the stronger `THOROUGH_MODEL`. Slower, but finds more matching lines. The Activity panel shows *why* files are uncertain; some (subtitles in another language, a different cut, two videos sharing a name) can't be settled by listening harder.
+* **Retry failed**, and **Re-run "needs fix"** (after a dry run).
 * **Force**: re-check even if nothing changed.
 * **Pause / Clear queue**.
 
@@ -127,6 +130,9 @@ If you use this, turn **off** Bazarr's own *automatic subtitle synchronization*,
 | `MEDIA_ROOTS` | `/media` | Comma-separated library roots (only paths inside these are touched) |
 | `WHISPER_MODEL` | `small-q5_1` | ggml model name from [whisper.cpp models](https://huggingface.co/ggerganov/whisper.cpp) or a path to a `.bin`. `base-q5_1` is lighter; `small.en-q5_1` is better for English-only libraries |
 | `WHISPER_DEVICE` | `auto` | `auto`, `cuda`, `cpu` |
+| `WHISPER_INSTANCES` | `2` | whisper servers running in parallel (each needs the model's VRAM, ~0.6 GB for small-q5_1). Set `WORKERS` to at least this + 1 |
+| `THOROUGH_MODEL` | `medium-q5_0` | Stronger model (~1.5 GB VRAM) used only by "Thorough re-check". Empty = same as `WHISPER_MODEL` |
+| `WHISPER_FLASH_ATTN` | `false` | whisper.cpp flash attention (may speed up newer GPUs) |
 | `WHISPER_VAD` | `false` | whisper.cpp's Silero voice-activity detection. Off by default: with whisper.cpp 1.7.6 its timestamps are unstable (sometimes ~30 ms, sometimes seconds off) |
 | `MODEL_IDLE_UNLOAD` | `300` | Seconds idle before the whisper server is stopped and VRAM is freed |
 | `AUDIO_LANGUAGE` | *(auto)* | Force audio language, e.g. `en` |

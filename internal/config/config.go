@@ -17,19 +17,22 @@ type Config struct {
 	LogLevel   string
 
 	// Transcription
-	Transcriber     string // local | openai
-	WhisperModel    string // ggml model name (e.g. small-q5_1) or path to a .bin
-	WhisperDevice   string // auto | cuda | cpu
-	WhisperThreads  int
-	WhisperVAD      bool
-	WhisperVADModel string
-	WhisperBinDir   string
-	WhisperPort     int
-	AudioLanguage   string // "" = auto-detect
-	ModelIdleUnload time.Duration
-	OpenAIBaseURL   string
-	OpenAIKey       string
-	OpenAIModel     string
+	Transcriber      string // local | openai
+	WhisperModel     string // ggml model name (e.g. small-q5_1) or path to a .bin
+	WhisperDevice    string // auto | cuda | cpu
+	WhisperThreads   int
+	WhisperVAD       bool
+	WhisperInstances int // whisper servers running in parallel for the main model
+	WhisperFlashAttn bool
+	ThoroughModel    string // stronger model for thorough re-checks of uncertain files ("" = same model)
+	WhisperVADModel  string
+	WhisperBinDir    string
+	WhisperPort      int
+	AudioLanguage    string // "" = auto-detect
+	ModelIdleUnload  time.Duration
+	OpenAIBaseURL    string
+	OpenAIKey        string
+	OpenAIModel      string
 
 	// Analysis
 	AnalysisMode       string // sample | full
@@ -190,19 +193,22 @@ func Load() *Config {
 		Port:       integer("PORT", 8080),
 		LogLevel:   strings.ToUpper(str("LOG_LEVEL", "INFO")),
 
-		Transcriber:     strings.ToLower(str("TRANSCRIBER", "local")),
-		WhisperModel:    str("WHISPER_MODEL", "small-q5_1"),
-		WhisperDevice:   strings.ToLower(str("WHISPER_DEVICE", "auto")),
-		WhisperThreads:  integer("WHISPER_THREADS", 4),
-		WhisperVAD:      boolean("WHISPER_VAD", false), // whisper.cpp 1.7.6 VAD timestamps are unstable
-		WhisperVADModel: str("WHISPER_VAD_MODEL", "silero-v5.1.2"),
-		WhisperBinDir:   str("WHISPER_BIN_DIR", "/usr/local/bin"),
-		WhisperPort:     integer("WHISPER_PORT", 8178),
-		AudioLanguage:   NormalizeLang(str("AUDIO_LANGUAGE", "")),
-		ModelIdleUnload: time.Duration(integer("MODEL_IDLE_UNLOAD", 300)) * time.Second,
-		OpenAIBaseURL:   strings.TrimRight(str("OPENAI_BASE_URL", "https://api.openai.com/v1"), "/"),
-		OpenAIKey:       str("OPENAI_API_KEY", ""),
-		OpenAIModel:     str("OPENAI_MODEL", "whisper-1"),
+		Transcriber:      strings.ToLower(str("TRANSCRIBER", "local")),
+		WhisperModel:     str("WHISPER_MODEL", "small-q5_1"),
+		WhisperDevice:    strings.ToLower(str("WHISPER_DEVICE", "auto")),
+		WhisperThreads:   integer("WHISPER_THREADS", 4),
+		WhisperVAD:       boolean("WHISPER_VAD", false),
+		WhisperInstances: max(1, integer("WHISPER_INSTANCES", 2)),
+		WhisperFlashAttn: boolean("WHISPER_FLASH_ATTN", false),
+		ThoroughModel:    str("THOROUGH_MODEL", "medium-q5_0"), // whisper.cpp 1.7.6 VAD timestamps are unstable
+		WhisperVADModel:  str("WHISPER_VAD_MODEL", "silero-v5.1.2"),
+		WhisperBinDir:    str("WHISPER_BIN_DIR", "/usr/local/bin"),
+		WhisperPort:      integer("WHISPER_PORT", 8178),
+		AudioLanguage:    NormalizeLang(str("AUDIO_LANGUAGE", "")),
+		ModelIdleUnload:  time.Duration(integer("MODEL_IDLE_UNLOAD", 300)) * time.Second,
+		OpenAIBaseURL:    strings.TrimRight(str("OPENAI_BASE_URL", "https://api.openai.com/v1"), "/"),
+		OpenAIKey:        str("OPENAI_API_KEY", ""),
+		OpenAIModel:      str("OPENAI_MODEL", "whisper-1"),
 
 		AnalysisMode:       strings.ToLower(str("ANALYSIS_MODE", "sample")),
 		SampleWindows:      max(3, integer("SAMPLE_WINDOWS", 12)),
@@ -258,7 +264,7 @@ func (c *Config) Public() map[string]any {
 	}
 	return map[string]any{
 		"media_roots": c.MediaRoots, "transcriber": c.Transcriber, "whisper_model": c.WhisperModel,
-		"whisper_device": c.WhisperDevice, "whisper_vad": c.WhisperVAD, "audio_language": c.AudioLanguage,
+		"whisper_device": c.WhisperDevice, "whisper_instances": c.WhisperInstances, "thorough_model": c.ThoroughModel, "whisper_vad": c.WhisperVAD, "audio_language": c.AudioLanguage,
 		"model_idle_unload_s": c.ModelIdleUnload.Seconds(), "openai_base_url": c.OpenAIBaseURL,
 		"openai_model": c.OpenAIModel, "openai_api_key": key,
 		"analysis_mode": c.AnalysisMode, "sample_windows": c.SampleWindows,

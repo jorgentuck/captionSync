@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -109,15 +110,16 @@ func (p *Processor) params() align.Params {
 // Nothing is written unless every file involved is still exactly as it was when it was read:
 // a subtitle Bazarr replaced, or a video Sonarr/Radarr upgraded mid-run, sends the file back to
 // the queue instead of being overwritten with stale content.
-func (p *Processor) Process(ctx context.Context, path string, progress func(string)) Outcome {
+func (p *Processor) Process(ctx context.Context, path, reason string, progress func(string)) Outcome {
 	started := time.Now()
+	thorough := strings.HasPrefix(reason, "thorough")
 	sigBefore := p.lib.Signature(path)
 	if sigBefore == "" {
 		return Outcome{Status: store.Missing, Message: "File no longer exists"}
 	}
 	videoStamp := stampOf(path)
 	if p.lib.SharedStem(path) {
-		return Outcome{Status: store.Uncertain, Signature: sigBefore,
+		return Outcome{Status: store.Uncertain, Signature: sigBefore, Details: map[string]any{"reason": "shared_name"},
 			Message: "Another video in this folder has the same name; its subtitle files can't be matched to one of them safely, left unchanged"}
 	}
 	sidecarList := p.lib.Sidecars(path)
@@ -222,6 +224,7 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 		out.Status, out.Message = store.Failed, "No usable subtitles: "+tracks[0].err
 		if short == len(tracks) {
 			out.Status, out.Message = store.Uncertain, "Subtitles too short to analyse"
+			out.Details["reason"] = "too_short"
 		}
 		out.Details["tracks"] = trackDetails(tracks)
 		return out
@@ -233,17 +236,38 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 		return fail(out, fmt.Errorf("no audio stream / unknown duration"))
 	}
 	delay := pr.AudioDelay(audio)
-	sampled := p.cfg.AnalysisMode != "full"
-	tr, err := p.transcribe(ctx, path, audio, dur, delay, sampled, progress)
-	if err != nil {
+	eng := p.engine
+	if thorough {
+		eng = p.engine.Thorough() // stronger model, whole film
+	}
+	tm := &timing{}
+	j := &listenJob{path: path, audio: audio, delay: delay, engine: eng, tm: tm, progress: progress}
+	tr := &transcript{language: p.cfg.AudioLanguage}
+
+	// Escalation ladder: 12 sample windows -> 36 more windows between them -> the whole film.
+	n, w := p.cfg.SampleWindows, p.cfg.SampleWindowSec
+	if p.cfg.AnalysisMode != "full" && !thorough && dur > float64(n*w)*1.2 {
+		tr.sampled = true
+		if err := p.listen(ctx, j, spread(dur, n, w, 0), "sample", tr); err != nil {
+			return fail(out, err)
+		}
+	} else if err := p.listen(ctx, j, chunks(dur, p.cfg.FullChunkSec), "chunk", tr); err != nil {
 		return fail(out, err)
 	}
 	p.analyse(tracks, tr, dur, progress)
+	if tr.sampled && wantsFull(tracks) && dur >= 3600 {
+		slog.Info("sampled analysis not conclusive, listening to more of the film", "path", path)
+		if err := p.listen(ctx, j, spread(dur, 3*n, w, 0.5), "extra sample", tr); err != nil {
+			return fail(out, err)
+		}
+		p.analyse(tracks, tr, dur, progress)
+	}
 	if tr.sampled && wantsFull(tracks) {
 		why := "AUTO_FULL is off"
 		if p.cfg.AutoFull {
 			slog.Info("sampled analysis not conclusive, running full pass", "path", path)
-			full, err := p.transcribe(ctx, path, audio, dur, delay, false, progress)
+			full := &transcript{language: tr.language}
+			err := p.listen(ctx, j, chunks(dur, p.cfg.FullChunkSec), "chunk", full)
 			switch {
 			case err == nil:
 				tr = full
@@ -260,7 +284,7 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 				continue
 			}
 			if t.result.Status == "needs_fix" {
-				t.result.Status = "uncertain"
+				t.result.Status, t.result.Reason = "uncertain", "needs_full"
 				t.result.Message += " - needs a full analysis (" + why + "), left unchanged"
 			} else if t.result.Status == "in_sync" {
 				t.result.Message += " (sampled only; " + why + ")"
@@ -374,6 +398,14 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 	out.Details["audio_language"] = tr.language
 	out.Details["audio_delay_s"] = math.Round(delay*1000) / 1000
 	out.Details["analysis"] = map[bool]string{true: "sample", false: "full"}[tr.sampled]
+	out.Details["thorough"] = thorough
+	out.Details["timing"] = tm.summary(time.Since(started))
+	for _, t := range tracks {
+		if t.err == "" && t.result.Status == "uncertain" && t.result.Reason != "" {
+			out.Details["reason"] = t.result.Reason
+			break
+		}
+	}
 	out.Details["audio_analysed_s"] = math.Round(tr.seconds)
 	out.Details["elapsed_s"] = math.Round(time.Since(started).Seconds()*10) / 10
 	out.Details["dry_run"] = p.cfg.DryRun
@@ -512,6 +544,7 @@ func trackDetails(tracks []*track) []map[string]any {
 			"changed_lines": t.changed}
 		if t.err == "" || t.written {
 			d["status"] = t.result.Status
+			d["reason"] = t.result.Reason
 			d["message"] = t.result.Message
 			d["cues"] = t.result.Cues
 			d["anchors"] = t.result.Anchors
@@ -526,16 +559,24 @@ func trackDetails(tracks []*track) []map[string]any {
 
 // --- listening -------------------------------------------------------------
 
-func windows(dur float64, sampled bool, n, w, chunk int) [][2]float64 {
-	if sampled && dur > float64(n*w)*1.2 {
-		margin := math.Min(120, dur*0.03)
-		usable := dur - 2*margin - float64(w)
-		out := make([][2]float64, n)
-		for i := range out {
-			out[i] = [2]float64{margin + usable*float64(i)/float64(n-1), float64(w)}
+// spread places n windows of w seconds evenly over the film (avoiding the very start and end);
+// phase 0.5 puts them halfway between the windows of a phase-0 spread.
+func spread(dur float64, n, w int, phase float64) [][2]float64 {
+	margin := math.Min(120, dur*0.03)
+	usable := dur - 2*margin - float64(w)
+	out := make([][2]float64, n)
+	for i := range out {
+		f := (float64(i) + phase) / float64(n-1)
+		if phase != 0 {
+			f = (float64(i) + phase) / float64(n)
 		}
-		return out
+		out[i] = [2]float64{margin + usable*f, float64(w)}
 	}
+	return out
+}
+
+// chunks covers the whole film.
+func chunks(dur float64, chunk int) [][2]float64 {
 	var out [][2]float64
 	for s := 0.0; s < dur; s += float64(chunk) {
 		out = append(out, [2]float64{s, math.Min(float64(chunk), dur-s)})
@@ -549,14 +590,40 @@ type pcmChunk struct {
 	err           error
 }
 
-// transcribe listens to the windows (sampled) or the whole file in chunks. delay is the audio
-// stream's start delay: ffmpeg's PCM for a window that begins before the audio does starts at
-// the audio's first sample, not at the window start.
-func (p *Processor) transcribe(ctx context.Context, path string, audio int, dur, delay float64, sampled bool,
-	progress func(string)) (*transcript, error) {
-	wins := windows(dur, sampled, p.cfg.SampleWindows, p.cfg.SampleWindowSec, p.cfg.FullChunkSec)
-	tr := &transcript{sampled: sampled && len(wins) == p.cfg.SampleWindows && dur > float64(p.cfg.SampleWindows*p.cfg.SampleWindowSec)*1.2}
-	lang := p.cfg.AudioLanguage
+// timing records where a job's time went.
+type timing struct {
+	mu                     sync.Mutex
+	decode, whisper, audio float64
+	passes                 []string
+}
+
+func (t *timing) summary(total time.Duration) map[string]any {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	rtf := 0.0
+	if t.whisper > 0 {
+		rtf = math.Round(t.audio/t.whisper*10) / 10
+	}
+	return map[string]any{"total_s": math.Round(total.Seconds()*10) / 10, "decode_s": math.Round(t.decode*10) / 10,
+		"whisper_s": math.Round(t.whisper*10) / 10, "audio_s": math.Round(t.audio), "realtime_x": rtf, "passes": t.passes}
+}
+
+type listenJob struct {
+	path     string
+	audio    int
+	delay    float64
+	engine   whisper.Engine
+	tm       *timing
+	progress func(string)
+}
+
+// listen transcribes the given windows and appends the result to tr. delay is the audio stream's
+// start delay: ffmpeg's PCM for a window that begins before the audio does starts at the audio's
+// first sample, not at the window start.
+func (p *Processor) listen(ctx context.Context, j *listenJob, wins [][2]float64, kind string, tr *transcript) error {
+	j.tm.mu.Lock()
+	j.tm.passes = append(j.tm.passes, kind)
+	j.tm.mu.Unlock()
 
 	// decode the next window with ffmpeg while the current one is being transcribed
 	ch := make(chan pcmChunk, 2)
@@ -565,7 +632,11 @@ func (p *Processor) transcribe(ctx context.Context, path string, audio int, dur,
 	go func() {
 		defer close(ch)
 		for _, w := range wins {
-			pcm, err := media.ReadAudio(cctx, path, audio, w[0], w[1])
+			t0 := time.Now()
+			pcm, err := media.ReadAudio(cctx, j.path, j.audio, w[0], w[1])
+			j.tm.mu.Lock()
+			j.tm.decode += time.Since(t0).Seconds()
+			j.tm.mu.Unlock()
 			select {
 			case ch <- pcmChunk{w[0], w[1], pcm, err}:
 			case <-cctx.Done():
@@ -581,40 +652,40 @@ func (p *Processor) transcribe(ctx context.Context, path string, audio int, dur,
 	for c := range ch {
 		i++
 		if c.err != nil {
-			return nil, fmt.Errorf("decode audio: %w", c.err)
+			return fmt.Errorf("decode audio: %w", c.err)
 		}
 		if len(c.pcm) < media.SampleRate*2 { // < 1 s of audio
 			continue
 		}
-		kind := "sample"
-		if !tr.sampled {
-			kind = "chunk"
-		}
-		progress(fmt.Sprintf("listening (%s %d/%d)", kind, i, len(wins)))
-		res, err := p.engine.Transcribe(ctx, c.pcm, lang)
-		if err != nil {
-			return nil, err
-		}
-		start := math.Max(c.start, delay) // where PCM sample 0 really is
+		j.progress(fmt.Sprintf("listening (%s %d/%d)", kind, i, len(wins)))
+		base := math.Max(c.start, j.delay) // where PCM sample 0 really is
 		actual := float64(len(c.pcm)) / (2 * media.SampleRate)
-		tr.spans = append(tr.spans, [2]float64{start, start + actual})
+		tr.spans = append(tr.spans, [2]float64{base, base + actual})
 		tr.seconds += actual
+		t0 := time.Now()
+		res, err := j.engine.Transcribe(ctx, c.pcm, tr.language)
+		if err != nil {
+			return err
+		}
+		j.tm.mu.Lock()
+		j.tm.whisper += time.Since(t0).Seconds()
+		j.tm.audio += actual
+		j.tm.mu.Unlock()
 		words := res.Words
 		if res.SegmentLevel {
 			refineStarts(words, c.pcm, actual)
 		}
 		for _, w := range words {
-			tr.words = append(tr.words, align.Word{Text: w.Text, Start: start + w.Start, End: start + w.End,
+			tr.words = append(tr.words, align.Word{Text: w.Text, Start: base + w.Start, End: base + w.End,
 				Reliable: w.Reliable})
 		}
 		// lock the language once detected so every window is transcribed consistently
-		if lang == "" && res.Language != "" && len(res.Words) >= 20 {
-			lang = config.NormalizeLang(res.Language)
+		if tr.language == "" && res.Language != "" && len(res.Words) >= 8 {
+			tr.language = config.NormalizeLang(res.Language)
 		}
 	}
-	tr.language = lang
 	tr.speech = speechSpans(tr.words)
-	return tr, nil
+	return nil
 }
 
 func speechSpans(words []align.Word) [][2]float64 {

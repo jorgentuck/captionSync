@@ -51,6 +51,8 @@ type Engine interface {
 	Transcribe(ctx context.Context, pcm []byte, language string) (*Chunk, error)
 	Status() map[string]any
 	Close()
+	// Thorough returns the engine to use for thorough re-checks (a stronger model, if configured).
+	Thorough() Engine
 }
 
 // wav wraps 16 kHz mono s16le PCM in a WAV header.

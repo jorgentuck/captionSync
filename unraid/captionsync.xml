@@ -19,7 +19,9 @@
   <Config Name="AppData" Target="/config" Default="/mnt/user/appdata/captionsync" Mode="rw" Description="Database, model and subtitle backups" Type="Path" Display="always" Required="true">/mnt/user/appdata/captionsync</Config>
   <Config Name="NVIDIA_VISIBLE_DEVICES" Target="NVIDIA_VISIBLE_DEVICES" Default="all" Description="GPU UUID (from the Nvidia Driver plugin) or 'all'" Type="Variable" Display="always" Required="false">all</Config>
   <Config Name="Whisper model" Target="WHISPER_MODEL" Default="small-q5_1" Description="small-q5_1 (~0.5-1 GB VRAM), base-q5_1 (lighter), small.en-q5_1 (English only)" Type="Variable" Display="always" Required="false">small-q5_1</Config>
-  <Config Name="Workers" Target="WORKERS" Default="2" Description="Files processed in parallel" Type="Variable" Display="always" Required="false">2</Config>
+  <Config Name="Workers" Target="WORKERS" Default="4" Description="Files processed in parallel (at least whisper instances + 1)" Type="Variable" Display="always" Required="false">4</Config>
+  <Config Name="Whisper instances" Target="WHISPER_INSTANCES" Default="3" Description="whisper servers in parallel (~0.6 GB VRAM each with small-q5_1)" Type="Variable" Display="always" Required="false">3</Config>
+  <Config Name="Thorough model" Target="THOROUGH_MODEL" Default="medium-q5_0" Description="Stronger model for 'Thorough re-check' of uncertain files (~1.5 GB VRAM, only loaded when used)" Type="Variable" Display="advanced" Required="false">medium-q5_0</Config>
   <Config Name="Watch mode" Target="WATCH_MODE" Default="inotify" Description="inotify | poll | off" Type="Variable" Display="always" Required="false">inotify</Config>
   <Config Name="Settle seconds" Target="SETTLE_SECONDS" Default="90" Description="Wait until a file has been unchanged this long before processing" Type="Variable" Display="advanced" Required="false">90</Config>
   <Config Name="Embedded subtitles" Target="EMBEDDED_SUBS" Default="report" Description="report (list only) | remux (fix inside the video) | sidecar (write fixed copy as .srt) | off" Type="Variable" Display="always" Required="false">report</Config>

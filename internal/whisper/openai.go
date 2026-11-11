@@ -41,6 +41,8 @@ func (o *OpenAI) Status() map[string]any {
 
 func (o *OpenAI) Close() {}
 
+func (o *OpenAI) Thorough() Engine { return o }
+
 func New(cfg *config.Config) Engine {
 	if cfg.Transcriber == "openai" {
 		return NewOpenAI(cfg)

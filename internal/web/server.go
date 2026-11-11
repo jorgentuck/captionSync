@@ -115,6 +115,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		"stats": stats, "statuses": store.AllStatuses,
 		"paused": s.svc.Paused(), "current": s.svc.Current(), "queue": queue, "scans": s.svc.Scans(),
 		"watcher_pending": s.pending(), "engine": s.engine.Status(), "settings": s.cfg.Public(),
+		"perf": s.svc.Perf(stats[store.Queued]), "uncertain_reasons": s.store.UncertainReasons(),
 	})
 }
 
@@ -157,8 +158,9 @@ func (s *Server) file(w http.ResponseWriter, r *http.Request) {
 }
 
 type processReq struct {
-	Path  string `json:"path"`
-	Force bool   `json:"force"`
+	Path     string `json:"path"`
+	Force    bool   `json:"force"`
+	Thorough bool   `json:"thorough"` // whole film with the stronger THOROUGH_MODEL
 }
 
 // process handles one file or one folder.
@@ -194,7 +196,11 @@ func (s *Server) process(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 202, map[string]any{"kind": "folder", "scan": sc.ID})
 		return
 	}
-	res, err := s.svc.EnqueueFile(p, "manual", req.Force, store.PriorityNow)
+	reason := "manual"
+	if req.Thorough {
+		reason = "thorough re-check"
+	}
+	res, err := s.svc.EnqueueFile(p, reason, req.Force || req.Thorough, store.PriorityNow)
 	if err != nil {
 		writeErr(w, 400, err)
 		return
@@ -212,6 +218,7 @@ func (s *Server) processAll(w http.ResponseWriter, r *http.Request) {
 func (s *Server) processStatus(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Statuses []string `json:"statuses"`
+		Thorough bool     `json:"thorough"`
 	}
 	if err := readJSON(r, &req); err != nil || len(req.Statuses) == 0 {
 		writeErr(w, 400, errors.New("statuses is required"))
@@ -223,7 +230,11 @@ func (s *Server) processStatus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	sc, err := s.svc.RequeueStatus(req.Statuses, "recheck")
+	reason := "recheck"
+	if req.Thorough {
+		reason = "thorough re-check"
+	}
+	sc, err := s.svc.RequeueStatus(req.Statuses, reason)
 	if err != nil {
 		writeErr(w, 500, err)
 		return
