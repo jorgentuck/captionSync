@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CaptionSync</title>
+<style>
+:root{--bg:#f6f7f9;--panel:#fff;--text:#1d2129;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--accent-ink:#fff;
+--ok:#15803d;--warn:#b45309;--bad:#b91c1c;--info:#1d4ed8;--chip:#eef2f7}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--panel:#171a21;--text:#e6e8ec;--muted:#9aa3b2;--line:#272c36;
+--accent:#3b82f6;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--info:#93c5fd;--chip:#222733}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:17px;margin:0;font-weight:650}
+header .sub{color:var(--muted);font-size:12px}
+header .right{margin-left:auto;display:flex;gap:8px;align-items:center}
+main{max-width:1280px;margin:0 auto;padding:18px 20px;display:grid;gap:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.card h2{font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:0 0 10px;font-weight:600}
+.stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px}
+.stat{border:1px solid var(--line);border-radius:8px;padding:10px 12px;cursor:pointer;background:var(--panel)}
+.stat:hover,.stat.sel{border-color:var(--accent)}
+.stat .n{font-size:22px;font-weight:650;font-variant-numeric:tabular-nums}
+.stat .l{font-size:12px;color:var(--muted)}
+.grid2{display:grid;grid-template-columns:1.2fr 1fr;gap:16px}
+@media (max-width:900px){.grid2{grid-template-columns:1fr}}
+button{font:inherit;border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:7px;padding:7px 12px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+button:disabled{opacity:.5;cursor:default}
+input[type=text],select{font:inherit;border:1px solid var(--line);background:var(--bg);color:var(--text);border-radius:7px;padding:7px 10px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.grow{flex:1;min-width:200px}
+.muted{color:var(--muted)}
+.small{font-size:12px}
+.browser{border:1px solid var(--line);border-radius:8px;max-height:260px;overflow:auto;margin-top:10px}
+.browser div{padding:6px 10px;border-bottom:1px solid var(--line);cursor:pointer;display:flex;gap:8px;align-items:center}
+.browser div:last-child{border-bottom:0}
+.browser div:hover{background:var(--chip)}
+.browser .sel{background:var(--chip);font-weight:600}
+.actions{display:grid;gap:8px}
+.actions .row button{flex:1}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:12px;color:var(--muted);font-weight:600}
+tr.clickable{cursor:pointer}
+tr.clickable:hover td{background:var(--chip)}
+.path{word-break:break-all}
+.chip{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:var(--chip);white-space:nowrap}
+.s-fixed{color:var(--ok)} .s-in_sync{color:var(--ok)} .s-needs_fix{color:var(--warn)} .s-uncertain{color:var(--warn)}
+.s-embedded{color:var(--info)} .s-failed{color:var(--bad)} .s-missing{color:var(--muted)} .s-no_subs{color:var(--muted)} .s-queued,.s-processing{color:var(--info)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.pager{display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:10px}
+dialog{border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--text);max-width:900px;width:calc(100% - 32px);padding:0}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+dialog .hd{display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line)}
+dialog .bd{padding:14px 16px;max-height:70vh;overflow:auto}
+.toast{position:fixed;bottom:18px;right:18px;background:var(--text);color:var(--bg);padding:9px 14px;border-radius:8px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:420px}
+.toast.show{opacity:.95}
+.kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:var(--muted)}
+.dot.on{background:var(--ok)}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>CaptionSync</h1>
+    <div class="sub">Fixes subtitle timing by listening to the audio. Only timestamps are changed.</div>
+  </div>
+  <div class="right">
+    <span class="small muted" id="engine"></span>
+    <button id="pauseBtn">Pause</button>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Library</h2>
+    <div class="stats" id="stats"></div>
+  </section>
+
+  <div class="grid2">
+    <section class="card">
+      <h2>Process</h2>
+      <div class="row">
+        <input type="text" id="path" class="grow" placeholder="/media/tv/Show/Season 1  or a single video file">
+        <button class="primary" id="goPath">Process path</button>
+      </div>
+      <div class="row small" style="margin-top:8px">
+        <label><input type="checkbox" id="force"> Force: re-check even if already handled and unchanged</label>
+      </div>
+      <div class="browser" id="browser"></div>
+      <div class="actions" style="margin-top:12px">
+        <div class="row">
+          <button id="goAll" title="Walk every media root and queue new or changed videos">Process all new / changed</button>
+          <button id="goInSync" title="Re-check files previously found to need no changes">Re-check “in sync”</button>
+        </div>
+        <div class="row">
+          <button id="goUncertain">Retry uncertain</button>
+          <button id="goFailed">Retry failed</button>
+          <button id="goNeedsFix" title="Files flagged during a dry run">Re-run “needs fix”</button>
+          <button id="goEmbedded" title="Videos whose only subtitles are embedded (after setting EMBEDDED_SUBS=remux or sidecar)">Re-check embedded-only</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Activity</h2>
+      <div id="current" class="small"></div>
+      <div id="scans" class="small" style="margin-top:8px"></div>
+      <div class="row" style="margin-top:10px;justify-content:space-between">
+        <span class="small muted" id="queueInfo"></span>
+        <button id="clearQueue">Clear queue</button>
+      </div>
+      <div id="queue" class="small mono" style="margin-top:6px;max-height:160px;overflow:auto"></div>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>Files</h2>
+    <div class="row">
+      <select id="fStatus"><option value="">All statuses</option></select>
+      <input type="text" id="fQuery" class="grow" placeholder="Filter by path…">
+    </div>
+    <table style="margin-top:10px">
+      <thead><tr><th>Status</th><th>File</th><th>Shift</th><th>Result</th><th>Updated</th></tr></thead>
+      <tbody id="files"></tbody>
+    </table>
+    <div class="pager">
+      <span class="small muted" id="pageInfo"></span>
+      <button id="prev">‹ Prev</button><button id="next">Next ›</button>
+    </div>
+  </section>
+</main>
+
+<dialog id="detail">
+  <div class="hd"><strong id="dTitle" class="path"></strong><button style="margin-left:auto" onclick="detail.close()">Close</button></div>
+  <div class="bd" id="dBody"></div>
+</dialog>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const LABELS = {queued:"Queued",processing:"Processing",fixed:"Fixed",in_sync:"In sync",needs_fix:"Needs fix",
+  uncertain:"Uncertain",embedded:"Embedded only",no_subs:"No subtitles",failed:"Failed",missing:"Missing",new:"Not processed"};
+const state = {status:"", q:"", offset:0, limit:50, browsePath:"", selected:""};
+
+function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+function ago(ts){ if(!ts) return ""; const d=Date.now()/1000-ts;
+  if(d<60) return Math.round(d)+"s ago"; if(d<3600) return Math.round(d/60)+"m ago";
+  if(d<86400) return Math.round(d/3600)+"h ago"; return new Date(ts*1000).toLocaleDateString(); }
+function shift(ms){ if(ms===null||ms===undefined) return ""; return (ms>0?"+":"")+(ms/1000).toFixed(2)+" s"; }
+function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove("show"),3500); }
+async function api(path, opts={}){
+  const r = await fetch(path, {headers:{"Content-Type":"application/json"}, ...opts});
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.error||r.statusText);
+  return j;
+}
+const post = (path, body) => api(path, {method:"POST", body: JSON.stringify(body||{})});
+
+async function refreshStatus(){
+  const s = await api("/api/status");
+  const order = s.statuses;
+  $("#stats").innerHTML = order.filter(k=>s.stats[k]||["fixed","in_sync","queued"].includes(k)).map(k =>
+    `<div class="stat ${state.status===k?"sel":""}" data-s="${k}"><div class="n s-${k}">${s.stats[k]||0}</div><div class="l">${LABELS[k]||k}</div></div>`).join("");
+  document.querySelectorAll(".stat").forEach(el=>el.onclick=()=>{ state.status = state.status===el.dataset.s?"":el.dataset.s;
+    $("#fStatus").value=state.status; state.offset=0; refreshFiles(); refreshStatus(); });
+  if($("#fStatus").options.length===1) order.forEach(k=>$("#fStatus").add(new Option(LABELS[k]||k,k)));
+
+  const e = s.engine;
+  $("#engine").innerHTML = `<span class="dot ${e.loaded||e.engine==="openai"?"on":""}"></span> ${esc(e.engine)} · ${esc(e.model)}${e.device?" · "+esc(e.device):""}${s.settings.dry_run?" · <b>DRY RUN</b>":""} · embedded: ${esc(s.settings.embedded_subs)}`;
+  $("#pauseBtn").textContent = s.paused ? "Resume" : "Pause";
+  $("#pauseBtn").dataset.paused = s.paused;
+
+  $("#current").innerHTML = s.current.length ? s.current.map(c =>
+    `<div>▶ <span class="path">${esc(c.path)}</span><br><span class="muted">${esc(c.stage)} · ${Math.round((Date.now()-new Date(c.started))/1000)}s</span></div>`).join("")
+    : `<span class="muted">${s.paused?"Paused.":"Idle."}${s.watcher_pending?` Watching ${s.watcher_pending} file(s) settle…`:""}</span>`;
+  $("#scans").innerHTML = s.scans.slice(0,4).map(sc =>
+    `<div class="muted">${sc.done?"✓":"…"} ${esc(sc.label)} — found ${sc.found}, queued ${sc.queued}, skipped ${sc.skipped}${sc.error?" · "+esc(sc.error):""}</div>`).join("");
+  const qn = s.stats.queued||0;
+  $("#queueInfo").textContent = qn ? `${qn} queued` : "Queue empty";
+  $("#queue").innerHTML = s.queue.map(q=>`<div class="path">${esc(q.path)}</div>`).join("") + (qn>s.queue.length?`<div class="muted">… and ${qn-s.queue.length} more</div>`:"");
+}
+
+async function refreshFiles(){
+  const p = new URLSearchParams({status:state.status, q:state.q, limit:state.limit, offset:state.offset});
+  const r = await api("/api/files?"+p);
+  $("#files").innerHTML = r.files.map(f => `<tr class="clickable" data-id="${f.id}">
+    <td><span class="chip s-${f.status}">${LABELS[f.status]||f.status}</span></td>
+    <td class="path">${esc(f.path)}</td><td class="mono">${shift(f.offset_ms)}</td>
+    <td class="small">${esc(f.message)}</td><td class="small muted">${ago(f.updated_at)}</td></tr>`).join("")
+    || `<tr><td colspan="5" class="muted">Nothing here yet. Process a folder or wait for the watcher.</td></tr>`;
+  document.querySelectorAll("#files tr[data-id]").forEach(tr=>tr.onclick=()=>showDetail(tr.dataset.id));
+  const end = Math.min(state.offset+state.limit, r.total);
+  $("#pageInfo").textContent = r.total ? `${state.offset+1}–${end} of ${r.total}` : "";
+  $("#prev").disabled = state.offset===0; $("#next").disabled = end>=r.total;
+}
+
+async function showDetail(id){
+  const r = await api("/api/files/"+id); const f = r.file; const d = f.details||{};
+  $("#dTitle").textContent = f.path;
+  const tracks = (d.tracks||[]).map(t => {
+    const pieces = (t.mapping?.pieces||[]).map(p=>`<tr><td class="mono">${p.start==null?"start":fmtT(p.start)} → ${p.end==null?"end":fmtT(p.end)}</td><td class="mono">${shift(p.offset_ms)}</td><td class="mono">${p.drift_s_per_hour?p.drift_s_per_hour+" s/h":""}</td><td>${p.anchors||""}</td></tr>`).join("");
+    return `<div class="card" style="margin-top:10px"><strong>${esc(t.file)}</strong> <span class="chip s-${t.status||"failed"}">${LABELS[t.status]||t.status||"error"}</span>
+      <div class="small" style="margin-top:4px">${esc(t.error||t.message)}</div>
+      ${t.cues?`<div class="small muted">${t.cues} cues · ${t.anchors} matched to speech · median shift ${shift(t.median_shift_ms)} · max ${shift(t.max_shift_ms)}${t.mapping?" · method "+esc(t.mapping.method)+(t.mapping.scale&&t.mapping.scale!==1?" · framerate ×"+t.mapping.scale.toFixed(4):""):""}${t.written?" · <b>"+t.changed_lines+" lines rewritten</b>":""}</div>`:""}
+      ${pieces?`<table style="margin-top:6px"><thead><tr><th>Range</th><th>Shift</th><th>Drift</th><th>Anchors</th></tr></thead><tbody>${pieces}</tbody></table>`:""}</div>`;
+  }).join("");
+  $("#dBody").innerHTML = `<div class="kv small">
+      <span class="muted">Status</span><span><span class="chip s-${f.status}">${LABELS[f.status]||f.status}</span></span>
+      <span class="muted">Subtitle files</span><span>${esc((r.subtitles||[]).join(", ")||"none")}</span>
+      ${(d.embedded||[]).length?`<span class="muted">Embedded</span><span>${d.embedded.map(e=>esc(e.label)+(e.text?"":" <span class='muted'>(image, can't retime)</span>")).join("<br>")}</span>`:""}
+      ${d.analysis?`<span class="muted">Analysis</span><span>${esc(d.analysis)} · ${d.audio_analysed_s}s of audio · language ${esc(d.audio_language||"?")} · took ${d.elapsed_s}s</span>`:""}
+      <span class="muted">Attempts</span><span>${f.attempts}</span></div>
+    ${tracks}
+    <div class="row" style="margin-top:12px"><button onclick="reprocess(${JSON.stringify(f.path).replace(/"/g,"&quot;")})">Re-check this file</button></div>
+    <h2 style="font-size:12px;color:var(--muted);margin:16px 0 6px">HISTORY</h2>
+    <table class="small">${r.history.map(h=>`<tr><td class="muted">${new Date(h.ts*1000).toLocaleString()}</td><td><span class="chip s-${h.status}">${LABELS[h.status]||h.status}</span></td><td>${esc(h.message)}</td></tr>`).join("")}</table>`;
+  $("#detail").showModal();
+}
+function fmtT(s){ s=Math.max(0,s); const h=Math.floor(s/3600), m=Math.floor(s%3600/60), x=Math.floor(s%60); return `${h}:${String(m).padStart(2,"0")}:${String(x).padStart(2,"0")}`; }
+async function reprocess(path){ try{ const r = await post("/api/process",{path,force:true}); toast("Queued: "+r.result); detail.close(); tick(); }catch(e){ toast(e.message); } }
+
+async function browse(path){
+  try{
+    const r = await api("/api/browse?path="+encodeURIComponent(path||""));
+    state.browsePath = r.path;
+    const rows = [];
+    if(r.path) rows.push(`<div data-p="${esc(r.parent)}" data-dir="1">⬆ <span class="muted">${r.parent?"..":"media roots"}</span></div>`);
+    r.entries.forEach(e => rows.push(`<div data-p="${esc(e.path)}" data-dir="${e.dir?1:""}" class="${state.selected===e.path?"sel":""}">${e.dir?"📁":"🎬"} <span class="grow">${esc(e.name)}</span>${e.status?`<span class="chip s-${e.status}">${LABELS[e.status]||e.status}</span>`:""}</div>`));
+    $("#browser").innerHTML = rows.join("") || `<div class="muted">Empty</div>`;
+    document.querySelectorAll("#browser div[data-p]").forEach(el => {
+      el.onclick = () => { state.selected = el.dataset.p; $("#path").value = el.dataset.p;
+        document.querySelectorAll("#browser .sel").forEach(x=>x.classList.remove("sel")); el.classList.add("sel"); };
+      if(el.dataset.dir) el.ondblclick = () => browse(el.dataset.p);
+    });
+    if(r.path){ $("#path").value = r.path; state.selected = r.path; }
+  }catch(e){ toast(e.message); }
+}
+
+$("#goPath").onclick = async () => {
+  const path = $("#path").value.trim(); if(!path) return toast("Pick a file or folder first");
+  try{ const r = await post("/api/process",{path, force:$("#force").checked});
+    toast(r.kind==="folder" ? "Scanning folder…" : "File: "+r.result); tick(); }catch(e){ toast(e.message); }
+};
+$("#goAll").onclick = async () => { try{ await post("/api/process/all",{force:$("#force").checked}); toast("Scanning all media roots…"); tick(); }catch(e){ toast(e.message); } };
+const recheck = (statuses,msg) => async () => { try{ await post("/api/process/status",{statuses}); toast(msg); tick(); }catch(e){ toast(e.message); } };
+$("#goInSync").onclick = recheck(["in_sync"], "Re-checking files marked in sync…");
+$("#goUncertain").onclick = recheck(["uncertain"], "Retrying uncertain files…");
+$("#goFailed").onclick = recheck(["failed"], "Retrying failed files…");
+$("#goNeedsFix").onclick = recheck(["needs_fix"], "Re-running files flagged by dry run…");
+$("#goEmbedded").onclick = recheck(["embedded"], "Re-checking embedded-only files…");
+$("#clearQueue").onclick = async () => { if(!confirm("Remove everything waiting in the queue?")) return;
+  const r = await post("/api/queue/clear"); toast(`Cleared ${r.cleared}`); tick(); };
+$("#pauseBtn").onclick = async () => { await post($("#pauseBtn").dataset.paused==="true"?"/api/worker/resume":"/api/worker/pause"); tick(); };
+$("#fStatus").onchange = e => { state.status=e.target.value; state.offset=0; tick(); };
+let qT; $("#fQuery").oninput = e => { clearTimeout(qT); qT=setTimeout(()=>{ state.q=e.target.value.trim(); state.offset=0; refreshFiles(); },250); };
+$("#prev").onclick = () => { state.offset=Math.max(0,state.offset-state.limit); refreshFiles(); };
+$("#next").onclick = () => { state.offset+=state.limit; refreshFiles(); };
+const detail = $("#detail");
+
+async function tick(){ try{ await Promise.all([refreshStatus(), refreshFiles()]); }catch(e){ console.error(e); } }
+tick(); browse(""); setInterval(tick, 4000);
+</script>
+</body>
+</html>

@@ -1,0 +1,281 @@
+// Package subtitle reads SRT, WebVTT and ASS/SSA files and rewrites ONLY their timestamps.
+//
+// Files are handled line by line as raw bytes: the text, styling, encoding, BOM and line
+// endings are written back exactly as they were - the only bytes that change are the times.
+package subtitle
+
+import (
+	"bytes"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+)
+
+type Cue struct {
+	Start, End float64 // seconds
+	Text       string  // UTF-8
+}
+
+type entry struct {
+	line       int
+	start, end float64
+	cue        bool // false for ASS "Comment:" lines (shifted, but not used for matching)
+	text       string
+	// ASS only
+	prefix       string
+	fields       []string
+	startF, endF int
+	srtRest      string
+}
+
+type File struct {
+	Path    string
+	Format  string // srt | vtt | ass
+	lines   []string
+	nl      string
+	entries []entry
+}
+
+var timingRe = regexp.MustCompile(`^\s*((?:\d+:)?\d{1,2}:\d{1,2}[,.]\d{1,3})\s*-->\s*((?:\d+:)?\d{1,2}:\d{1,2}[,.]\d{1,3})(.*)$`)
+
+func Load(path string) (*File, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	f := &File{Path: path, nl: "\n"}
+	if bytes.Contains(raw, []byte("\r\n")) {
+		f.nl = "\r\n"
+	}
+	text := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	f.lines = strings.Split(text, "\n")
+
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".ass", ".ssa":
+		f.Format = "ass"
+		err = f.parseASS()
+	case ".vtt":
+		f.Format = "vtt"
+		f.parseTimed()
+	default:
+		f.Format = "srt"
+		f.parseTimed()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(f.entries) == 0 {
+		return nil, fmt.Errorf("no subtitle cues found")
+	}
+	return f, nil
+}
+
+// --- SRT / VTT -------------------------------------------------------------
+
+func parseClock(s string) (float64, bool) {
+	s = strings.ReplaceAll(s, ",", ".")
+	parts := strings.Split(s, ":")
+	var h, m float64
+	var sec string
+	switch len(parts) {
+	case 3:
+		hh, err1 := strconv.Atoi(parts[0])
+		mm, err2 := strconv.Atoi(parts[1])
+		if err1 != nil || err2 != nil {
+			return 0, false
+		}
+		h, m, sec = float64(hh), float64(mm), parts[2]
+	case 2:
+		mm, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return 0, false
+		}
+		m, sec = float64(mm), parts[1]
+	default:
+		return 0, false
+	}
+	sv, err := strconv.ParseFloat(sec, 64)
+	if err != nil {
+		return 0, false
+	}
+	return h*3600 + m*60 + sv, true
+}
+
+func (f *File) parseTimed() {
+	for i := 0; i < len(f.lines); i++ {
+		m := timingRe.FindStringSubmatch(f.lines[i])
+		if m == nil {
+			continue
+		}
+		st, ok1 := parseClock(m[1])
+		en, ok2 := parseClock(m[2])
+		if !ok1 || !ok2 {
+			continue
+		}
+		var text []string
+		j := i + 1
+		for ; j < len(f.lines) && strings.TrimSpace(f.lines[j]) != ""; j++ {
+			if timingRe.MatchString(f.lines[j]) {
+				break
+			}
+			text = append(text, f.lines[j])
+		}
+		f.entries = append(f.entries, entry{line: i, start: st, end: en, cue: true,
+			text: toUTF8(strings.Join(text, "\n")), srtRest: m[3]})
+		i = j - 1
+	}
+}
+
+func fmtClock(t float64, sep string) string {
+	ms := int64(math.Round(math.Max(0, t) * 1000))
+	return fmt.Sprintf("%02d:%02d:%02d%s%03d", ms/3600000, ms/60000%60, ms/1000%60, sep, ms%1000)
+}
+
+// --- ASS / SSA -------------------------------------------------------------
+
+func parseASSClock(s string) (float64, bool) {
+	return parseClock(strings.TrimSpace(s))
+}
+
+func fmtASSClock(t float64) string {
+	cs := int64(math.Round(math.Max(0, t) * 100))
+	return fmt.Sprintf("%d:%02d:%02d.%02d", cs/360000, cs/6000%60, cs/100%60, cs%100)
+}
+
+func (f *File) parseASS() error {
+	inEvents := false
+	var format []string
+	for i, line := range f.lines {
+		t := strings.TrimSpace(strings.TrimPrefix(line, "\uFEFF"))
+		if strings.HasPrefix(t, "[") {
+			inEvents = strings.EqualFold(t, "[Events]")
+			continue
+		}
+		if !inEvents {
+			continue
+		}
+		colon := strings.Index(line, ":")
+		if colon < 0 {
+			continue
+		}
+		kind := strings.TrimSpace(line[:colon])
+		body := line[colon+1:]
+		if strings.EqualFold(kind, "Format") {
+			format = nil
+			for _, fld := range strings.Split(body, ",") {
+				format = append(format, strings.ToLower(strings.TrimSpace(fld)))
+			}
+			continue
+		}
+		isDialogue := strings.EqualFold(kind, "Dialogue")
+		if !isDialogue && !strings.EqualFold(kind, "Comment") {
+			continue
+		}
+		if format == nil {
+			format = []string{"layer", "start", "end", "style", "name", "marginl", "marginr", "marginv", "effect", "text"}
+		}
+		fields := strings.SplitN(body, ",", len(format))
+		if len(fields) != len(format) {
+			continue
+		}
+		si, ei := indexOf(format, "start"), indexOf(format, "end")
+		if si < 0 || ei < 0 {
+			return fmt.Errorf("ASS Format line has no Start/End")
+		}
+		st, ok1 := parseASSClock(fields[si])
+		en, ok2 := parseASSClock(fields[ei])
+		if !ok1 || !ok2 {
+			continue
+		}
+		f.entries = append(f.entries, entry{line: i, start: st, end: en, cue: isDialogue,
+			text: toUTF8(fields[len(fields)-1]), prefix: line[:colon+1], fields: fields, startF: si, endF: ei})
+	}
+	return nil
+}
+
+func indexOf(xs []string, s string) int {
+	for i, x := range xs {
+		if x == s {
+			return i
+		}
+	}
+	return -1
+}
+
+// --- public API -------------------------------------------------------------
+
+// Cues returns the dialogue cues (used for matching against speech).
+func (f *File) Cues() []Cue {
+	out := make([]Cue, 0, len(f.entries))
+	for _, e := range f.entries {
+		if e.cue && strings.TrimSpace(e.text) != "" {
+			out = append(out, Cue{Start: e.start, End: e.end, Text: e.text})
+		}
+	}
+	return out
+}
+
+// Retime applies fn to every timed line and returns how many changed.
+func (f *File) Retime(fn func(start, end float64) (float64, float64)) int {
+	changed := 0
+	for k := range f.entries {
+		e := &f.entries[k]
+		ns, ne := fn(e.start, e.end)
+		ns = math.Max(0, ns)
+		if ne <= ns {
+			ne = ns + 0.01
+		}
+		var line string
+		switch f.Format {
+		case "ass":
+			fields := append([]string(nil), e.fields...)
+			fields[e.startF] = fmtASSClock(ns)
+			fields[e.endF] = fmtASSClock(ne)
+			line = e.prefix + strings.Join(fields, ",")
+		case "vtt":
+			line = fmtClock(ns, ".") + " --> " + fmtClock(ne, ".") + e.srtRest
+		default:
+			line = fmtClock(ns, ",") + " --> " + fmtClock(ne, ",") + e.srtRest
+		}
+		if line != f.lines[e.line] {
+			changed++
+			f.lines[e.line] = line
+		}
+	}
+	return changed
+}
+
+func (f *File) Bytes() []byte { return []byte(strings.Join(f.lines, f.nl)) }
+
+// --- encoding ---------------------------------------------------------------
+
+var cp1252 = [32]rune{
+	'€', '\u0081', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u008d', 'Ž', '\u008f',
+	'\u0090', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u009d', 'ž', 'Ÿ',
+}
+
+// toUTF8 converts legacy Windows-1252/Latin-1 text for matching (the file itself is never re-encoded).
+func toUTF8(s string) string {
+	s = strings.TrimPrefix(s, "\uFEFF")
+	if utf8.ValidString(s) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c < 0x80:
+			b.WriteByte(c)
+		case c < 0xA0:
+			b.WriteRune(cp1252[c-0x80])
+		default:
+			b.WriteRune(rune(c))
+		}
+	}
+	return b.String()
+}

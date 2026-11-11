@@ -1,0 +1,29 @@
+services:
+  captionsync:
+    image: ghcr.io/jorgentuck/captionsync:latest
+    # build: .                      # or build it yourself
+    container_name: captionsync
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/config            # database, downloaded model, subtitle backups
+      - /mnt/user/media:/media      # must be read-write: subtitle files are rewritten in place
+    environment:
+      PUID: "99"
+      PGID: "100"
+      TZ: "America/Chicago"
+      WHISPER_MODEL: "small-q5_1"   # ~0.5-1 GB VRAM. Lighter: base-q5_1. English-only libraries: small.en-q5_1
+      WORKERS: "2"                  # parallel files (ffmpeg overlaps with GPU work)
+      WATCH_MODE: "inotify"
+      SETTLE_SECONDS: "90"
+      # PATH_MAPPINGS: "/data/media:/media"   # if Tdarr/Bazarr see the library under a different path
+      EMBEDDED_SUBS: "report"       # report | remux | sidecar | off
+      # DRY_RUN: "true"                       # report only, change nothing (good for a first pass)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

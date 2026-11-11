@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>captionSync</Name>
+  <Repository>ghcr.io/jorgentuck/captionsync:latest</Repository>
+  <Registry>https://github.com/jorgentuck/captionSync/pkgs/container/captionsync</Registry>
+  <Project>https://github.com/jorgentuck/captionSync</Project>
+  <Support>https://github.com/jorgentuck/captionSync/issues</Support>
+  <TemplateURL>https://raw.githubusercontent.com/jorgentuck/captionSync/main/unraid/captionsync.xml</TemplateURL>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Overview>Fixes the timing of existing subtitle files (e.g. from Bazarr). Listens to the audio with a small local speech model and shifts subtitle timestamps to match the dialogue. Only timestamps are changed.</Overview>
+  <Category>MediaApp:Video Tools:</Category>
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <ExtraParams>--runtime=nvidia</ExtraParams>
+  <Config Name="WebUI Port" Target="8080" Default="8080" Mode="tcp" Description="Web interface" Type="Port" Display="always" Required="true">8080</Config>
+  <Config Name="Media" Target="/media" Default="/mnt/user/media" Mode="rw" Description="Your media library (read-write: subtitle files are rewritten)" Type="Path" Display="always" Required="true">/mnt/user/media</Config>
+  <Config Name="AppData" Target="/config" Default="/mnt/user/appdata/captionsync" Mode="rw" Description="Database, model and subtitle backups" Type="Path" Display="always" Required="true">/mnt/user/appdata/captionsync</Config>
+  <Config Name="NVIDIA_VISIBLE_DEVICES" Target="NVIDIA_VISIBLE_DEVICES" Default="all" Description="GPU UUID (from the Nvidia Driver plugin) or 'all'" Type="Variable" Display="always" Required="false">all</Config>
+  <Config Name="Whisper model" Target="WHISPER_MODEL" Default="small-q5_1" Description="small-q5_1 (~0.5-1 GB VRAM), base-q5_1 (lighter), small.en-q5_1 (English only)" Type="Variable" Display="always" Required="false">small-q5_1</Config>
+  <Config Name="Workers" Target="WORKERS" Default="2" Description="Files processed in parallel" Type="Variable" Display="always" Required="false">2</Config>
+  <Config Name="Watch mode" Target="WATCH_MODE" Default="inotify" Description="inotify | poll | off" Type="Variable" Display="always" Required="false">inotify</Config>
+  <Config Name="Settle seconds" Target="SETTLE_SECONDS" Default="90" Description="Wait until a file has been unchanged this long before processing" Type="Variable" Display="advanced" Required="false">90</Config>
+  <Config Name="Embedded subtitles" Target="EMBEDDED_SUBS" Default="report" Description="report (list only) | remux (fix inside the video) | sidecar (write fixed copy as .srt) | off" Type="Variable" Display="always" Required="false">report</Config>
+  <Config Name="Dry run" Target="DRY_RUN" Default="false" Description="true = analyse and report only, change nothing" Type="Variable" Display="always" Required="false">false</Config>
+  <Config Name="Path mappings" Target="PATH_MAPPINGS" Default="" Description="from:to pairs for hook paths, e.g. /data/media:/media" Type="Variable" Display="advanced" Required="false"></Config>
+  <Config Name="Transcriber" Target="TRANSCRIBER" Default="local" Description="local (whisper.cpp) or openai (any OpenAI-compatible API)" Type="Variable" Display="advanced" Required="false">local</Config>
+  <Config Name="OpenAI base URL" Target="OPENAI_BASE_URL" Default="https://api.openai.com/v1" Description="Only for TRANSCRIBER=openai" Type="Variable" Display="advanced" Required="false">https://api.openai.com/v1</Config>
+  <Config Name="OpenAI API key" Target="OPENAI_API_KEY" Default="" Description="Only for TRANSCRIBER=openai" Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+  <Config Name="PUID" Target="PUID" Default="99" Type="Variable" Display="advanced" Required="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Type="Variable" Display="advanced" Required="false">100</Config>
+</Container>

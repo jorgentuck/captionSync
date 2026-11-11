@@ -1,0 +1,12 @@
+# local runtime data
+/config/
+/media/
+*.db
+*.db-wal
+*.db-shm
+
+# build output
+/captionsync
+/dist/
+
+.DS_Store
