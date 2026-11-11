@@ -410,40 +410,119 @@ func min(a, b int) int {
 	return b
 }
 
-func fitPiece(seg []Anchor) Piece {
-	n := float64(len(seg))
-	var mean float64
-	for _, a := range seg {
-		mean += a.SubTime
+// maxLineDrift is the largest drift (s per s, ~10.8 s/h) fitted as a line; bigger framerate
+// mismatches are handled by the framerate search, which rescales the subtitle first.
+const maxLineDrift = 0.003
+
+// fitLine robustly fits delta = offset + slope*(t-ref) and returns the anchors it explains.
+// Drift is only kept when it is statistically clear and makes a real difference, so noisy
+// anchors never produce a fake slope.
+func fitLine(as []Anchor, tol float64) (Piece, []Anchor) {
+	n := len(as)
+	var ref float64
+	for _, a := range as {
+		ref += a.SubTime
 	}
-	mean /= n
-	ds := deltas(seg)
-	p := Piece{Offset: median(ds), Ref: mean, Anchors: len(seg)}
-	span := seg[len(seg)-1].SubTime - seg[0].SubTime
-	if len(seg) >= 8 && span >= 300 {
-		var sxx, sxy, sy float64
-		for _, a := range seg {
-			x := a.SubTime - mean
-			sxx += x * x
-			sxy += x * a.Delta()
-			sy += a.Delta()
-		}
-		if sxx > 0 {
-			slope := sxy / sxx
-			icpt := sy / n
-			linRes := make([]float64, len(seg))
-			constRes := make([]float64, len(seg))
-			for i, a := range seg {
-				linRes[i] = math.Abs(a.Delta() - (icpt + slope*(a.SubTime-mean)))
-				constRes[i] = math.Abs(a.Delta() - p.Offset)
-			}
-			// accept drift only if it is real (>= 0.2 s across the segment) and clearly fits better
-			if math.Abs(slope) < 0.1 && math.Abs(slope)*span >= 0.2 && median(linRes) < median(constRes)*0.8 {
-				p.Offset, p.Slope = icpt, slope
+	ref /= float64(n)
+	span := as[n-1].SubTime - as[0].SubTime
+
+	slope := 0.0
+	if n >= 10 && span >= 600 { // Theil-Sen over pairs far apart: robust to wrong matches
+		var slopes []float64
+		stride := 1 + n/80
+		for i := 0; i < n; i++ {
+			for j := i + 1; j < n; j += stride {
+				if dt := as[j].SubTime - as[i].SubTime; dt >= 300 {
+					slopes = append(slopes, (as[j].Delta()-as[i].Delta())/dt)
+				}
 			}
 		}
+		if len(slopes) >= 20 {
+			slope = median(slopes)
+		}
+		if math.Abs(slope) > maxLineDrift {
+			slope = 0
+		}
 	}
-	return p
+	off := func(sl float64, set []Anchor) float64 {
+		r := make([]float64, len(set))
+		for i, a := range set {
+			r[i] = a.Delta() - sl*(a.SubTime-ref)
+		}
+		return median(r)
+	}
+	inliers := func(o, sl float64) []Anchor {
+		var in []Anchor
+		for _, a := range as {
+			if math.Abs(a.Delta()-(o+sl*(a.SubTime-ref))) <= tol {
+				in = append(in, a)
+			}
+		}
+		return in
+	}
+	o := off(slope, as)
+	in := inliers(o, slope)
+	if slope != 0 && len(in) >= 10 {
+		// least squares on the inliers, then keep the slope only if it is significant
+		var mx, my float64
+		for _, a := range in {
+			mx += a.SubTime
+			my += a.Delta()
+		}
+		k := float64(len(in))
+		mx, my = mx/k, my/k
+		var sxx, sxy float64
+		for _, a := range in {
+			sxx += (a.SubTime - mx) * (a.SubTime - mx)
+			sxy += (a.SubTime - mx) * (a.Delta() - my)
+		}
+		ls := sxy / sxx
+		var rss float64
+		for _, a := range in {
+			e := a.Delta() - (my + ls*(a.SubTime-mx))
+			rss += e * e
+		}
+		se := math.Sqrt(rss/math.Max(1, k-2)) / math.Sqrt(sxx)
+		inSpan := in[len(in)-1].SubTime - in[0].SubTime
+		if math.Abs(ls) <= maxLineDrift && math.Abs(ls) >= 4*se && math.Abs(ls)*inSpan >= 0.25 {
+			slope = ls
+		} else {
+			slope = 0
+		}
+	} else {
+		slope = 0
+	}
+	o = off(slope, in)
+	if len(in) == 0 {
+		o = off(slope, as)
+	}
+	in = inliers(o, slope)
+	if len(in) > 0 {
+		o = off(slope, in)
+	}
+	return Piece{Offset: o, Slope: slope, Ref: ref, Anchors: len(in)}, in
+}
+
+// mergeSegments joins neighbouring segments that are really one: timing is continuous where
+// they meet (a jump is a discontinuity; drift is not) and one line explains them both.
+func mergeSegments(segs [][]Anchor, tol float64) [][]Anchor {
+	for changed := true; changed && len(segs) > 1; {
+		changed = false
+		for i := 0; i < len(segs)-1; i++ {
+			end := median(deltas(tail(segs[i], 6)))
+			start := median(deltas(segs[i+1][:min(6, len(segs[i+1]))]))
+			if math.Abs(end-start) > tol {
+				continue
+			}
+			union := append(append([]Anchor(nil), segs[i]...), segs[i+1]...)
+			if _, in := fitLine(union, tol); float64(len(in)) >= 0.85*float64(len(union)) {
+				segs = append(segs[:i], append([][]Anchor{union}, segs[i+2:]...)...)
+				changed = true
+				break
+			}
+		}
+	}
+	return segs
 }
 
 // boundary picks where to switch between two segments: the largest gap between cues in (t1, t2].
@@ -466,32 +545,116 @@ func boundary(cues []Cue, t1, t2 float64) float64 {
 	return best
 }
 
-func FitMapping(anchors []Anchor, cues []Cue, p Params) *Mapping {
+// placeSwitch picks where timing changes from piece a to piece b, somewhere in (t1, t2].
+// Every loose match in that stretch votes for the piece whose shift it fits better; the switch
+// goes where the fewest votes disagree. Without votes it falls back to the largest gap.
+//
+// Loose matches are typically biased (e.g. late), so the bias is measured on each side, where
+// the right piece is already known, and removed before voting.
+func placeSwitch(cues []Cue, loose []Anchor, a, b Piece, aFrom, t1, t2, bTo float64) float64 {
+	fallback := boundary(cues, t1, t2)
+	bias := func(pc Piece, from, to float64) (float64, bool) {
+		var r []float64
+		for _, x := range loose {
+			if x.SubTime >= from && x.SubTime <= to {
+				if e := x.Delta() - pc.Shift(x.SubTime); math.Abs(e) < 5 {
+					r = append(r, e)
+				}
+			}
+		}
+		return median(r), len(r) >= 5
+	}
+	biasA, okA := bias(a, math.Max(aFrom, t1-900), t1)
+	biasB, okB := bias(b, t2, math.Min(bTo, t2+900))
+	if !okA || !okB {
+		return fallback
+	}
+	var votes []Anchor
+	for _, x := range loose {
+		if x.SubTime > t1 && x.SubTime < t2 {
+			votes = append(votes, x)
+		}
+	}
+	if len(votes) < 3 {
+		return fallback
+	}
+	cost := func(sw float64) float64 {
+		var c float64
+		for _, v := range votes {
+			e := v.Delta() - a.Shift(v.SubTime) - biasA
+			if v.SubTime >= sw {
+				e = v.Delta() - b.Shift(v.SubTime) - biasB
+			}
+			c += math.Min(math.Abs(e), 2)
+		}
+		return c
+	}
+	best, bestCost := fallback, cost(fallback)
+	for _, c := range cues {
+		if c.Start <= t1 || c.Start > t2 {
+			continue
+		}
+		if k := cost(c.Start); k < bestCost-1e-9 {
+			best, bestCost = c.Start, k
+		}
+	}
+	return best
+}
+
+// FitMapping chooses between one line for the whole file (offset, plus drift if it is real)
+// and separate sections (when the timing genuinely jumps, e.g. a different cut). Sections must
+// each be well supported and must explain clearly more anchors than the single line.
+//
+// loose are lower-precision matches (any word, not just segment starts); they are only used to
+// decide where exactly a jump happens. May be nil.
+func FitMapping(anchors, loose []Anchor, cues []Cue, p Params) *Mapping {
 	if len(anchors) < p.MinAnchors {
 		return nil
 	}
-	inl := localInliers(anchors, p.SplitTolerance)
+	tol := p.SplitTolerance
+	inl := localInliers(anchors, tol)
 	if len(inl) < p.MinAnchors {
 		return nil
 	}
-	segs := segment(inl, p.SplitTolerance, p.MinSegment)
-	pieces := make([]Piece, len(segs))
-	for i, s := range segs {
-		pieces[i] = fitPiece(s)
-	}
-	pieces[0].Start = math.Inf(-1)
-	pieces[len(pieces)-1].End = math.Inf(1)
-	for i := 0; i < len(segs)-1; i++ {
-		b := boundary(cues, segs[i][len(segs[i])-1].SubTime, segs[i+1][0].SubTime)
-		pieces[i].End, pieces[i+1].Start = b, b
-	}
-	m := &Mapping{Scale: 1, Pieces: pieces, Method: "text"}
-	var res []float64
-	for _, s := range segs {
-		for _, a := range s {
-			m.AnchorsUsed++
-			res = append(res, math.Abs(a.Delta()-m.ShiftAt(a.SubTime)))
+
+	line, lineIn := fitLine(inl, tol)
+	line.Start, line.End = math.Inf(-1), math.Inf(1)
+	pieces, used := []Piece{line}, lineIn
+
+	// A jump can masquerade as drift, so a sloped line always has to beat the sections model.
+	if line.Slope != 0 || float64(len(lineIn)) < 0.9*float64(len(inl)) {
+		minSeg := p.MinSegment
+		if minSeg < 8 {
+			minSeg = 8
 		}
+		segs := mergeSegments(segment(inl, tol, minSeg), tol)
+		if len(segs) > 1 {
+			var sp []Piece
+			var su []Anchor
+			for _, sg := range segs {
+				pc, in := fitLine(sg, tol)
+				sp = append(sp, pc)
+				su = append(su, in...)
+			}
+			// Sections that survive merging meet at a verified jump; they win when they explain at
+			// least as much as the single line (a small per-section cost breaks ties).
+			if len(su)-2*(len(segs)-1) >= len(lineIn) {
+				sp[0].Start = math.Inf(-1)
+				sp[len(sp)-1].End = math.Inf(1)
+				for i := 0; i < len(segs)-1; i++ {
+					b := placeSwitch(cues, loose, sp[i], sp[i+1], segs[i][0].SubTime,
+						segs[i][len(segs[i])-1].SubTime, segs[i+1][0].SubTime, segs[i+1][len(segs[i+1])-1].SubTime)
+					sp[i].End, sp[i+1].Start = b, b
+				}
+				pieces, used = sp, su
+			}
+		}
+	}
+
+	m := &Mapping{Scale: 1, Pieces: pieces, Method: "text", AnchorsUsed: len(used)}
+	res := make([]float64, 0, len(used))
+	for _, a := range used {
+		res = append(res, math.Abs(a.Delta()-m.ShiftAt(a.SubTime)))
 	}
 	m.ResidualMs = math.Round(median(res) * 1000)
 	m.Confidence = math.Round(1000*float64(m.AnchorsUsed)/float64(len(anchors))) / 1000
@@ -639,10 +802,11 @@ func fitScaled(cues []Cue, words []Word, p Params, k float64) (*Mapping, int) {
 		sc = scaleCues(cues, k)
 	}
 	anchors := FindAnchors(sc, words, p, true)
-	m := FitMapping(anchors, sc, p)
+	loose := FindAnchors(sc, words, p, false)
+	m := FitMapping(anchors, loose, sc, p)
 	if m == nil { // not enough trustworthy positions: use every word (noisier, outliers get filtered)
-		anchors = FindAnchors(sc, words, p, false)
-		m = FitMapping(anchors, sc, p)
+		anchors = loose
+		m = FitMapping(anchors, loose, sc, p)
 	}
 	if m != nil {
 		m.Scale = k
@@ -650,40 +814,52 @@ func fitScaled(cues []Cue, words []Word, p Params, k float64) (*Mapping, int) {
 	return m, len(anchors)
 }
 
-func needsRatioSearch(m *Mapping, cues int) bool {
-	if m == nil {
-		return true
+// needsRatioSearch: try framerate rescaling only when the plain fit is missing, split up or
+// explains too few of its anchors (a big framerate mismatch looks like that).
+func needsRatioSearch(m *Mapping) bool {
+	return m == nil || len(m.Pieces) > 1 || m.Confidence < 0.6
+}
+
+// minConfidentAnchors is the least evidence we act on, whatever MIN_ANCHORS says.
+const minConfidentAnchors = 12
+
+// weak reports whether a mapping rests on too little or too contradictory evidence to act on.
+func weak(m *Mapping, p Params) bool {
+	need := p.MinAnchors
+	if need < minConfidentAnchors {
+		need = minConfidentAnchors
 	}
-	if len(m.Pieces) > 2 || float64(m.AnchorsUsed) < 0.25*float64(cues) {
-		return true
-	}
-	for _, pc := range m.Pieces {
-		if math.Abs(pc.Slope) > 0.01 {
-			return true
-		}
-	}
-	return false
+	return m.AnchorsUsed < need || m.Confidence < 0.5
 }
 
 // Analyze decides whether a subtitle track is in sync and how to fix it.
 func Analyze(cues []Cue, words []Word, speech, spans [][2]float64, duration float64, p Params, sampled bool) Result {
 	r := Result{Cues: len(cues)}
 	m, nAnchors := fitScaled(cues, words, p, 1)
-	if needsRatioSearch(m, len(cues)) && len(words) > 0 {
+	if needsRatioSearch(m) && len(words) > 0 {
+		base := m
 		for _, k := range frameRatios {
 			m2, n2 := fitScaled(cues, words, p, k)
-			if m2 == nil {
+			if m2 == nil || weak(m2, p) || m2.Confidence < 0.6 {
 				continue
 			}
-			better := m == nil ||
-				float64(m2.AnchorsUsed) > 1.2*float64(m.AnchorsUsed) ||
-				(m2.AnchorsUsed >= m.AnchorsUsed && len(m2.Pieces) < len(m.Pieces))
-			if better {
+			// a rescale must be clearly better than no rescale, never just different
+			better := base == nil ||
+				(float64(m2.AnchorsUsed) >= 1.3*float64(base.AnchorsUsed) && len(m2.Pieces) <= len(base.Pieces))
+			if better && (m == base || m2.AnchorsUsed > m.AnchorsUsed) {
 				m, nAnchors = m2, n2
 			}
 		}
 	}
 	r.Anchors = nAnchors
+	if m != nil && weak(m, p) {
+		r.Status = "uncertain"
+		r.Mapping = m
+		r.Message = "Not enough reliable matches to act on (" + itoa(int64(m.AnchorsUsed)) + " consistent of " +
+			itoa(int64(nAnchors)) + " matched lines), left unchanged"
+		r.WantsFull = sampled
+		return r
+	}
 	if m != nil {
 		decide(cues, m, p, &r)
 		if m.Scale != 1 {

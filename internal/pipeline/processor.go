@@ -17,6 +17,7 @@ import (
 	"github.com/jorgentuck/captionSync/internal/config"
 	"github.com/jorgentuck/captionSync/internal/library"
 	"github.com/jorgentuck/captionSync/internal/media"
+	"github.com/jorgentuck/captionSync/internal/onset"
 	"github.com/jorgentuck/captionSync/internal/store"
 	"github.com/jorgentuck/captionSync/internal/subtitle"
 	"github.com/jorgentuck/captionSync/internal/whisper"
@@ -432,22 +433,18 @@ func (p *Processor) transcribe(ctx context.Context, path string, audio int, dur 
 		actual := float64(len(c.pcm)) / (2 * media.SampleRate)
 		tr.spans = append(tr.spans, [2]float64{c.start, c.start + actual})
 		tr.seconds += actual
-		firstSeg := true
+		var words []whisper.Word
 		for _, w := range res.Words {
-			if strings.TrimSpace(w.Text) == "" || strings.HasPrefix(strings.TrimSpace(w.Text), "[") {
-				continue // [BLANK_AUDIO], [Music] ...
+			if t := strings.TrimSpace(w.Text); t != "" && !strings.HasPrefix(t, "[") { // [BLANK_AUDIO], [Music]
+				words = append(words, w)
 			}
-			reliable := w.Reliable
-			if reliable && firstSeg && p.engine.Name() == "local" {
-				// whisper pins a chunk's first segment to 0.0 when the chunk opens on silence or
-				// mid-sentence, so that start time can't be trusted
-				firstSeg = false
-				if w.Start < 1.0 {
-					reliable = false
-				}
-			}
+		}
+		if p.engine.Name() == "local" {
+			refineStarts(words, c.pcm, actual)
+		}
+		for _, w := range words {
 			tr.words = append(tr.words, align.Word{Text: w.Text, Start: c.start + w.Start, End: c.start + w.End,
-				Reliable: reliable})
+				Reliable: w.Reliable})
 		}
 		// lock the language once detected so every window is transcribed consistently
 		if lang == "" && res.Language != "" && len(res.Words) >= 20 {
@@ -594,4 +591,30 @@ func (p *Processor) remuxVideo(ctx context.Context, video string, pr *media.Prob
 	}
 	matchOwner(tmp, st)
 	return os.Rename(tmp, video)
+}
+
+// refineStarts replaces whisper's segment start times (often in the silence before a line, up to
+// seconds early) with the speech onset measured in the audio. A segment whose onset can't be
+// found clearly is no longer treated as a trustworthy timing anchor.
+func refineStarts(words []whisper.Word, pcm []byte, length float64) {
+	det := onset.New(pcm)
+	var idx []int
+	for i, w := range words {
+		if w.Reliable {
+			idx = append(idx, i)
+		}
+	}
+	for k, i := range idx {
+		until := length
+		if k+1 < len(idx) {
+			until = words[idx[k+1]].Start
+		}
+		t, ok := det.Refine(words[i].Start, until)
+		// an onset right at the chunk's first moment means the chunk opened mid-sentence
+		if !ok || t < 0.3 {
+			words[i].Reliable = false
+			continue
+		}
+		words[i].Start = t
+	}
 }

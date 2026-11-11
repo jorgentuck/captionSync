@@ -153,7 +153,7 @@ func Load() *Config {
 		WhisperModel:    str("WHISPER_MODEL", "small-q5_1"),
 		WhisperDevice:   strings.ToLower(str("WHISPER_DEVICE", "auto")),
 		WhisperThreads:  integer("WHISPER_THREADS", 4),
-		WhisperVAD:      boolean("WHISPER_VAD", true),
+		WhisperVAD:      boolean("WHISPER_VAD", false), // whisper.cpp 1.7.6 VAD timestamps are unstable
 		WhisperVADModel: str("WHISPER_VAD_MODEL", "silero-v5.1.2"),
 		WhisperBinDir:   str("WHISPER_BIN_DIR", "/usr/local/bin"),
 		WhisperPort:     integer("WHISPER_PORT", 8178),
@@ -165,7 +165,7 @@ func Load() *Config {
 
 		AnalysisMode:       strings.ToLower(str("ANALYSIS_MODE", "sample")),
 		SampleWindows:      max(3, integer("SAMPLE_WINDOWS", 12)),
-		SampleWindowSec:    max(20, integer("SAMPLE_WINDOW_SECONDS", 60)),
+		SampleWindowSec:    max(45, integer("SAMPLE_WINDOW_SECONDS", 60)), // shorter windows give poor timestamps
 		FullChunkSec:       max(60, integer("FULL_CHUNK_SECONDS", 300)),
 		AutoFull:           boolean("AUTO_FULL", true),
 		MaxOffset:          float("MAX_OFFSET_SECONDS", 120),

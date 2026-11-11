@@ -2,7 +2,7 @@
 
 Fixes **subtitle timing** on your videos. Use it when subtitles from Bazarr show up too early or too late.
 
-It does **not** generate captions. For each video, a small speech model (whisper.cpp) listens to parts of the audio to find *when* dialogue is spoken. CaptionSync then matches your existing subtitle lines to those moments and rewrites **only the timestamps** in the `.srt` / `.ass` / `.vtt` sidecar files. The subtitle text, styling, encoding and line endings stay byte-for-byte the same. Video files are only read, unless you opt in to fixing embedded subtitles with `EMBEDDED_SUBS=remux`.
+It does **not** generate captions. For each video, a small speech model (whisper.cpp) listens to parts of the audio to find *which* line is spoken roughly *when*. The exact moment each line starts is then measured from the audio itself, because whisper's own timestamps are often seconds off. CaptionSync then matches your existing subtitle lines to those moments and rewrites **only the timestamps** in the `.srt` / `.ass` / `.vtt` sidecar files. The subtitle text, styling, encoding and line endings stay byte-for-byte the same. Video files are only read, unless you opt in to fixing embedded subtitles with `EMBEDDED_SUBS=remux`.
 
 It handles:
 
@@ -64,7 +64,7 @@ The image is built automatically by GitHub Actions and published as
    * **Dry run**: set `true` for your first pass if you'd like to see what it would change first.
 5. Click **Apply**, then open the WebUI (port 8080).
 
-The first run downloads the whisper model (~190 MB) and a tiny voice-activity model into `/config/models`.
+The first run downloads the whisper model (~190 MB) into `/config/models`.
 
 **Paths for hooks.** captionSync sees your folders as `/media/movies/...` and `/media/tv/...`. The Bazarr and
 Tdarr hooks send paths the way *those* containers see them. Look at their path mappings and set **Path mappings**
@@ -85,6 +85,7 @@ Plain Docker / Compose: see `docker-compose.yml`. To build the image yourself: `
 * **Process path**: a single file, or a folder (recursive). Pick one with the browser or paste a path.
 * **Process all new / changed**: walks every media root and queues videos that are new or whose video/subtitle files changed since they were last handled.
 * **Re-check "in sync"**: re-processes the files previously judged to need no change.
+* **Re-check "fixed"**: measures already-fixed files against the audio again and corrects them further if needed. Useful after an update that improves accuracy.
 * **Retry uncertain / failed**, and **Re-run "needs fix"** (after a dry run).
 * **Force**: re-check even if nothing changed.
 * **Pause / Clear queue**.
@@ -124,7 +125,7 @@ If you use this, turn **off** Bazarr's own *automatic subtitle synchronization*,
 | `MEDIA_ROOTS` | `/media` | Comma-separated library roots (only paths inside these are touched) |
 | `WHISPER_MODEL` | `small-q5_1` | ggml model name from [whisper.cpp models](https://huggingface.co/ggerganov/whisper.cpp) or a path to a `.bin`. `base-q5_1` is lighter; `small.en-q5_1` is better for English-only libraries |
 | `WHISPER_DEVICE` | `auto` | `auto`, `cuda`, `cpu` |
-| `WHISPER_VAD` | `true` | Silero voice-activity detection (885 KB model, auto-downloaded). Makes speech start times accurate to ~30 ms; leave on |
+| `WHISPER_VAD` | `false` | whisper.cpp's Silero voice-activity detection. Off by default: with whisper.cpp 1.7.6 its timestamps are unstable (sometimes ~30 ms, sometimes seconds off) |
 | `MODEL_IDLE_UNLOAD` | `300` | Seconds idle before the whisper server is stopped and VRAM is freed |
 | `AUDIO_LANGUAGE` | *(auto)* | Force audio language, e.g. `en` |
 | `PREFERRED_AUDIO_LANG` | | e.g. `eng,en`: which audio track to listen to when there are several |
@@ -132,7 +133,7 @@ If you use this, turn **off** Bazarr's own *automatic subtitle synchronization*,
 | `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` | OpenAI / – / `whisper-1` | For `TRANSCRIBER=openai` |
 | `WORKERS` | `2` | Files processed in parallel |
 | `ANALYSIS_MODE` | `sample` | `sample` or `full` |
-| `SAMPLE_WINDOWS` / `SAMPLE_WINDOW_SECONDS` | `12` / `60` | Sampled listening |
+| `SAMPLE_WINDOWS` / `SAMPLE_WINDOW_SECONDS` | `12` / `60` | Sampled listening (windows shorter than 45 s aren't allowed: timestamps get unreliable) |
 | `AUTO_FULL` | `true` | Escalate to a full pass when sampling is inconclusive |
 | `SYNC_THRESHOLD_MS` | `300` | Deviations below this count as "in sync" |
 | `MAX_OFFSET_SECONDS` | `120` | Largest offset searched for |

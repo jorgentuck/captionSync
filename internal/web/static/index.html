@@ -97,6 +97,7 @@ dialog .bd{padding:14px 16px;max-height:70vh;overflow:auto}
         <div class="row">
           <button id="goAll" title="Walk every media root and queue new or changed videos">Process all new / changed</button>
           <button id="goInSync" title="Re-check files previously found to need no changes">Re-check “in sync”</button>
+          <button id="goFixed" title="Measure already-fixed files against the audio again and correct them further if needed">Re-check “fixed”</button>
         </div>
         <div class="row">
           <button id="goUncertain">Retry uncertain</button>
@@ -251,6 +252,7 @@ $("#goPath").onclick = async () => {
 $("#goAll").onclick = async () => { try{ await post("/api/process/all",{force:$("#force").checked}); toast("Scanning all media roots…"); tick(); }catch(e){ toast(e.message); } };
 const recheck = (statuses,msg) => async () => { try{ await post("/api/process/status",{statuses}); toast(msg); tick(); }catch(e){ toast(e.message); } };
 $("#goInSync").onclick = recheck(["in_sync"], "Re-checking files marked in sync…");
+$("#goFixed").onclick = recheck(["fixed"], "Re-checking fixed files…");
 $("#goUncertain").onclick = recheck(["uncertain"], "Retrying uncertain files…");
 $("#goFailed").onclick = recheck(["failed"], "Retrying failed files…");
 $("#goNeedsFix").onclick = recheck(["needs_fix"], "Re-running files flagged by dry run…");

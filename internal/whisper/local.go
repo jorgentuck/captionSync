@@ -175,8 +175,8 @@ func (l *Local) launch(ctx context.Context, bin string) error {
 		"-nc", // never carry context from one request (another file / window) into the next
 	}
 	if l.cfg.WhisperVAD {
-		// Silero VAD makes segment start times land on speech onsets (~30 ms) instead of
-		// drifting into the preceding silence.
+		// Optional. Measured on whisper.cpp 1.7.6: VAD timestamps are sometimes perfect and
+		// sometimes seconds off, depending on tiny changes to the audio, so it is off by default.
 		args = append(args, "--vad", "-vm", l.vadPath())
 	}
 	cmd := exec.Command(bin, args...)
