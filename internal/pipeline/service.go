@@ -24,7 +24,9 @@ type Service struct {
 	lib   *library.Library
 	proc  *Processor
 
-	paused atomic.Bool
+	paused     atomic.Bool
+	engineDown atomic.Int64 // unix nanos until which workers back off (engine unavailable)
+	wg         sync.WaitGroup
 
 	mu      sync.Mutex
 	current map[int]*Current
@@ -61,7 +63,23 @@ func (s *Service) Run(ctx context.Context) {
 		slog.Info("re-queued interrupted files", "count", n)
 	}
 	for i := 0; i < s.cfg.Workers; i++ {
-		go s.worker(ctx, i)
+		s.wg.Add(1)
+		go func(i int) {
+			defer s.wg.Done()
+			s.worker(ctx, i)
+		}(i)
+	}
+}
+
+// Wait blocks until the workers have stopped (after the context is cancelled), up to timeout,
+// so a write or remux in progress can finish or clean up its temp files.
+func (s *Service) Wait(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() { s.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		slog.Warn("workers did not stop in time")
 	}
 }
 
@@ -72,6 +90,10 @@ func (s *Service) worker(ctx context.Context, id int) {
 		}
 		if s.paused.Load() {
 			sleep(ctx, 2*time.Second)
+			continue
+		}
+		if until := time.Unix(0, s.engineDown.Load()); time.Now().Before(until) {
+			sleep(ctx, time.Until(until))
 			continue
 		}
 		f, err := s.store.ClaimNext()
@@ -130,6 +152,17 @@ func (s *Service) handle(ctx context.Context, wid int, f *store.File) {
 	if ctx.Err() != nil {
 		return // shutting down: leave it 'processing' so it is re-queued on start
 	}
+	if out.Requeue {
+		if out.EngineDown {
+			s.engineDown.Store(time.Now().Add(time.Minute).UnixNano())
+			slog.Warn("transcription engine unavailable; pausing workers for a minute", "err", out.Message)
+		}
+		if err := s.store.Requeue(f.ID, out.Message, !out.EngineDown); err != nil {
+			slog.Error("requeue", "err", err)
+		}
+		slog.Info("requeued", "path", f.Path, "why", out.Message)
+		return
+	}
 	if err := s.store.Finish(f.ID, out.Status, out.Message, out.Signature, out.OffsetMs, out.Details); err != nil {
 		slog.Error("save result", "err", err)
 	}
@@ -163,9 +196,10 @@ func (s *Service) Scans() []Scan {
 
 var ErrNotAllowed = errors.New("path is outside MEDIA_ROOTS")
 
-// Resolve maps an incoming path (possibly from Tdarr/Bazarr) to the video it refers to.
+// Resolve maps a path (already translated with MapPath if it came from outside) to the video it
+// refers to.
 func (s *Service) Resolve(path string) (string, error) {
-	p := filepath.Clean(s.lib.MapPath(path))
+	p := filepath.Clean(path)
 	if !s.lib.Allowed(p) {
 		return "", ErrNotAllowed
 	}
@@ -188,6 +222,9 @@ func (s *Service) EnqueueFile(path, reason string, force bool, priority int) (st
 	}
 	if !s.lib.IsVideo(p) {
 		return "", fmt.Errorf("not a video file: %s", filepath.Base(p))
+	}
+	if s.lib.Ignored(p) {
+		return "", fmt.Errorf("ignored by IGNORE_PATTERNS: %s", p)
 	}
 	sig := s.lib.Signature(p)
 	if sig == "" {
@@ -233,7 +270,7 @@ func (s *Service) done(sc *Scan, err error) {
 
 // ScanPath walks a folder (or a root) in the background, queuing new/changed videos (or all, with force).
 func (s *Service) ScanPath(root, reason string, force bool, priority int) (*Scan, error) {
-	p := filepath.Clean(s.lib.MapPath(root))
+	p := filepath.Clean(root)
 	if !s.lib.Allowed(p) {
 		return nil, ErrNotAllowed
 	}

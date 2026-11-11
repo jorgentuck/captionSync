@@ -85,16 +85,17 @@ func percentile(xs []float64, p float64) float64 {
 }
 
 // Refine returns where speech really starts for a segment whisper says starts at t, searching
-// from just before t up to `until` (the next segment's start). ok is false when the audio
-// shows no clear onset there (e.g. continuous speech or loud background).
+// from just before t up to `until` (the next segment's start). ok is false when the audio shows
+// no clear onset there: continuous speech or loud background, or t already inside running speech
+// (then any later onset would belong to a different phrase).
 func (d *Detector) Refine(t, until float64) (float64, bool) {
 	if until <= t {
 		until = t + 4
 	}
-	until = math.Min(until, t+4)
+	until = math.Min(until, t+15) // whisper's start can sit at the previous line's end, long before
 	lo, hi := d.frame(t-0.3), d.frame(until)
 	ctx := d.db[d.frame(t-1.5):hi]
-	if hi-lo < 8 || len(ctx) < 20 {
+	if hi-lo < 14 || len(ctx) < 20 {
 		return t, false
 	}
 	floor, peak := percentile(ctx, 0.15), percentile(ctx, 0.95)
@@ -103,18 +104,20 @@ func (d *Detector) Refine(t, until float64) (float64, bool) {
 	}
 	thr := floor + 0.35*(peak-floor)
 	attack := floor + 0.15*(peak-floor)
-	for f := lo; f+5 < hi; f++ {
-		loud := true
-		for k := f; k < f+5; k++ { // 50 ms of sustained voice energy
-			if d.db[k] < thr {
-				loud = false
-				break
+
+	// speech-like: 120 ms mostly above the threshold (a click, cough or music hit is shorter)
+	sustained := func(f int) bool {
+		above := 0
+		for k := f; k < f+12; k++ {
+			if d.db[k] >= thr {
+				above++
 			}
 		}
-		if !loud {
-			continue
-		}
-		quiet, n := 0, 0 // ... coming out of mostly quiet (the previous 150 ms)
+		return d.db[f] >= thr && above >= 10
+	}
+	// ... coming out of mostly quiet (the previous 150 ms)
+	fromQuiet := func(f int) bool {
+		quiet, n := 0, 0
 		for k := f - 15; k < f; k++ {
 			if k < 0 {
 				continue
@@ -124,11 +127,27 @@ func (d *Detector) Refine(t, until float64) (float64, bool) {
 				quiet++
 			}
 		}
-		if n < 10 || float64(quiet) < 0.8*float64(n) {
+		return n >= 10 && float64(quiet) >= 0.8*float64(n)
+	}
+	ft := d.frame(t)
+	inSpeech := ft+12 < len(d.db) && sustained(ft)
+
+	for f := lo; f+12 < hi; f++ {
+		if !sustained(f) || !fromQuiet(f) {
 			continue
 		}
-		for f > 0 && d.db[f-1] >= attack { // back up to where the attack began
+		if inSpeech && float64(f)*frameSec > t+0.1 {
+			// t is inside speech that started before our search: the onset we'd report is the
+			// next phrase, not this one
+			return t, false
+		}
+		// back up to where the attack began - at most 100 ms, never through a gap into the
+		// previous line
+		for k := 0; k < 10 && f > 0 && d.db[f-1] >= attack; k++ {
 			f--
+		}
+		if f > 0 && d.db[f-1] >= attack {
+			return t, false // still rising after 100 ms: not a clean onset
 		}
 		return float64(f) * frameSec, true
 	}

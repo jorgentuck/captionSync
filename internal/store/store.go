@@ -198,29 +198,46 @@ func (s *Store) Enqueue(path, signature, reason string, force bool, priority int
 	return "queued", nil
 }
 
+// MaxAttempts: a file claimed this many times without ever finishing (crashes, restarts) is given up.
+const MaxAttempts = 5
+
 // ClaimNext atomically takes the next file: highest priority first, then oldest.
 func (s *Store) ClaimNext() (*File, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var id int64
-	var path, reason string
-	err := s.db.QueryRow(`SELECT id, path, reason FROM files WHERE status=? ORDER BY priority DESC, queued_at, id LIMIT 1`, Queued).
-		Scan(&id, &path, &reason)
-	if err == sql.ErrNoRows {
-		return nil, nil
+	for {
+		var id int64
+		var path, reason string
+		var attempts int
+		err := s.db.QueryRow(`SELECT id, path, reason, attempts FROM files WHERE status=? ORDER BY priority DESC, queued_at, id LIMIT 1`, Queued).
+			Scan(&id, &path, &reason, &attempts)
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		t := now()
+		if attempts >= MaxAttempts {
+			msg := fmt.Sprintf("gave up after %d attempts that never finished (crash, restart or hang)", attempts)
+			if _, err := s.db.Exec(`UPDATE files SET status=?, message=?, attempts=0, finished_at=?, updated_at=?, prev_status=NULL WHERE id=?`,
+				Failed, msg, t, t, id); err != nil {
+				return nil, err
+			}
+			s.history(id, Failed, msg)
+			continue
+		}
+		if _, err := s.db.Exec(`UPDATE files SET status=?, started_at=?, attempts=attempts+1, updated_at=? WHERE id=?`,
+			Processing, t, t, id); err != nil {
+			return nil, err
+		}
+		s.history(id, Processing, "")
+		return &File{ID: id, Path: path, Reason: reason, Status: Processing}, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	t := now()
-	if _, err := s.db.Exec(`UPDATE files SET status=?, started_at=?, attempts=attempts+1, updated_at=? WHERE id=?`,
-		Processing, t, t, id); err != nil {
-		return nil, err
-	}
-	s.history(id, Processing, "")
-	return &File{ID: id, Path: path, Reason: reason, Status: Processing}, nil
 }
 
+// Finish records the result of a job. It only applies to a file that is still 'processing' (so a
+// late result can never overwrite a newer state), and resets the unfinished-attempts counter.
 func (s *Store) Finish(id int64, status, message, signature string, offsetMs *int64, details any) error {
 	var d any
 	if details != nil {
@@ -230,10 +247,36 @@ func (s *Store) Finish(id int64, status, message, signature string, offsetMs *in
 	t := now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE files SET status=?, message=?, signature=?, offset_ms=?, details=?, finished_at=?,
-		updated_at=?, prev_status=NULL WHERE id=?`, status, message, signature, offsetMs, d, t, t, id)
-	s.history(id, status, message)
-	return err
+	res, err := s.db.Exec(`UPDATE files SET status=?, message=?, signature=?, offset_ms=?, details=?, finished_at=?,
+		updated_at=?, prev_status=NULL, attempts=0 WHERE id=? AND status=?`, status, message, signature, offsetMs, d, t, t, id, Processing)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		s.history(id, status, message)
+	}
+	return nil
+}
+
+// Requeue puts a file that is being processed back in the queue (same priority, same place).
+// countAttempt=false when it was not the file's fault (e.g. the engine was down).
+func (s *Store) Requeue(id int64, message string, countAttempt bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dec := 1
+	if countAttempt {
+		dec = 0
+	}
+	res, err := s.db.Exec(`UPDATE files SET status=?, message=?, attempts=MAX(0, attempts-?), updated_at=? WHERE id=? AND status=?`,
+		Queued, message, dec, now(), id, Processing)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		s.history(id, Queued, message)
+		s.notify()
+	}
+	return nil
 }
 
 // ResetProcessing re-queues anything interrupted by a restart.
@@ -256,11 +299,21 @@ func (s *Store) ClearQueue() (int64, error) {
 	return res.RowsAffected()
 }
 
+// MarkMissing records that a file is gone - unless it is queued or being processed (a worker
+// will find out itself; marking it here could let a second worker pick it up).
 func (s *Store) MarkMissing(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var id int64
-	var status, sig string
-	if err := s.db.QueryRow(`SELECT id, status, signature FROM files WHERE path=?`, path).Scan(&id, &status, &sig); err == nil && status != Missing {
-		_ = s.Finish(id, Missing, "File no longer exists", sig, nil, nil)
+	var status string
+	if err := s.db.QueryRow(`SELECT id, status FROM files WHERE path=?`, path).Scan(&id, &status); err != nil ||
+		status == Missing || status == Queued || status == Processing {
+		return
+	}
+	t := now()
+	if _, err := s.db.Exec(`UPDATE files SET status=?, message=?, finished_at=?, updated_at=?, prev_status=NULL WHERE id=?`,
+		Missing, "File no longer exists", t, t, id); err == nil {
+		s.history(id, Missing, "File no longer exists")
 	}
 }
 

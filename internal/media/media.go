@@ -20,6 +20,7 @@ type Stream struct {
 	Index       int               `json:"index"`
 	CodecType   string            `json:"codec_type"`
 	CodecName   string            `json:"codec_name"`
+	StartTime   string            `json:"start_time"`
 	Duration    string            `json:"duration"`
 	Tags        map[string]string `json:"tags"`
 	Disposition map[string]int    `json:"disposition"`
@@ -41,6 +42,7 @@ type Probe struct {
 	Format  struct {
 		Duration   string `json:"duration"`
 		FormatName string `json:"format_name"`
+		StartTime  string `json:"start_time"`
 	} `json:"format"`
 }
 
@@ -86,6 +88,27 @@ func (p *Probe) Duration() float64 {
 		}
 	}
 	return best
+}
+
+// AudioDelay is how late audio stream N (relative index) starts compared with the file's start.
+// ffmpeg's raw PCM output does not pad that gap, so audio decoded from before it begins late.
+func (p *Probe) AudioDelay(audioRel int) float64 {
+	fs, _ := strconv.ParseFloat(p.Format.StartTime, 64)
+	i := 0
+	for _, s := range p.Streams {
+		if s.CodecType != "audio" {
+			continue
+		}
+		if i == audioRel {
+			as, err := strconv.ParseFloat(s.StartTime, 64)
+			if err != nil || as-fs < 0.01 {
+				return 0
+			}
+			return as - fs
+		}
+		i++
+	}
+	return 0
 }
 
 // ChooseAudio returns the relative audio stream index (for -map 0:a:N), or -1.

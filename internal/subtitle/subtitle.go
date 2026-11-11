@@ -5,7 +5,6 @@
 package subtitle
 
 import (
-	"bytes"
 	"fmt"
 	"math"
 	"os"
@@ -31,13 +30,13 @@ type entry struct {
 	fields       []string
 	startF, endF int
 	srtRest      string
+	bom          bool // the timing line began with a UTF-8 BOM (first line of the file)
 }
 
 type File struct {
 	Path    string
 	Format  string // srt | vtt | ass
 	lines   []string
-	nl      string
 	entries []entry
 }
 
@@ -48,12 +47,9 @@ func Load(path string) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
-	f := &File{Path: path, nl: "\n"}
-	if bytes.Contains(raw, []byte("\r\n")) {
-		f.nl = "\r\n"
-	}
-	text := strings.ReplaceAll(string(raw), "\r\n", "\n")
-	f.lines = strings.Split(text, "\n")
+	f := &File{Path: path}
+	// Split on \n only: a line keeps its own trailing \r, so mixed line endings survive untouched.
+	f.lines = strings.Split(string(raw), "\n")
 
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".ass", ".ssa":
@@ -77,7 +73,9 @@ func Load(path string) (*File, error) {
 
 // --- SRT / VTT -------------------------------------------------------------
 
-func parseClock(s string) (float64, bool) {
+// parseClock reads H:MM:SS.frac or MM:SS.frac. With intMillis (SRT/VTT) the fraction is an integer
+// count of milliseconds, as ffmpeg/VLC/libass read it (",5" = 5 ms); otherwise (ASS) it is decimal.
+func parseClock(s string, intMillis bool) (float64, bool) {
 	s = strings.ReplaceAll(s, ",", ".")
 	parts := strings.Split(s, ":")
 	var h, m float64
@@ -99,6 +97,15 @@ func parseClock(s string) (float64, bool) {
 	default:
 		return 0, false
 	}
+	if intMillis {
+		whole, frac, _ := strings.Cut(sec, ".")
+		si, err1 := strconv.Atoi(whole)
+		fi, err2 := strconv.Atoi(frac)
+		if err1 != nil || err2 != nil {
+			return 0, false
+		}
+		return h*3600 + m*60 + float64(si) + float64(fi)/1000, true
+	}
 	sv, err := strconv.ParseFloat(sec, 64)
 	if err != nil {
 		return 0, false
@@ -108,12 +115,13 @@ func parseClock(s string) (float64, bool) {
 
 func (f *File) parseTimed() {
 	for i := 0; i < len(f.lines); i++ {
-		m := timingRe.FindStringSubmatch(f.lines[i])
+		line, bom := strings.CutPrefix(f.lines[i], "\uFEFF")
+		m := timingRe.FindStringSubmatch(line)
 		if m == nil {
 			continue
 		}
-		st, ok1 := parseClock(m[1])
-		en, ok2 := parseClock(m[2])
+		st, ok1 := parseClock(m[1], true)
+		en, ok2 := parseClock(m[2], true)
 		if !ok1 || !ok2 {
 			continue
 		}
@@ -123,10 +131,10 @@ func (f *File) parseTimed() {
 			if timingRe.MatchString(f.lines[j]) {
 				break
 			}
-			text = append(text, f.lines[j])
+			text = append(text, strings.TrimSuffix(f.lines[j], "\r"))
 		}
 		f.entries = append(f.entries, entry{line: i, start: st, end: en, cue: true,
-			text: toUTF8(strings.Join(text, "\n")), srtRest: m[3]})
+			text: toUTF8(strings.Join(text, "\n")), srtRest: m[3], bom: bom})
 		i = j - 1
 	}
 }
@@ -139,7 +147,7 @@ func fmtClock(t float64, sep string) string {
 // --- ASS / SSA -------------------------------------------------------------
 
 func parseASSClock(s string) (float64, bool) {
-	return parseClock(strings.TrimSpace(s))
+	return parseClock(strings.TrimSpace(s), false)
 }
 
 func fmtASSClock(t float64) string {
@@ -180,12 +188,16 @@ func (f *File) parseASS() error {
 			format = []string{"layer", "start", "end", "style", "name", "marginl", "marginr", "marginv", "effect", "text"}
 		}
 		fields := strings.SplitN(body, ",", len(format))
-		if len(fields) != len(format) {
-			continue
-		}
 		si, ei := indexOf(format, "start"), indexOf(format, "end")
 		if si < 0 || ei < 0 {
 			return fmt.Errorf("ASS Format line has no Start/End")
+		}
+		if si >= len(fields) || ei >= len(fields) {
+			continue // not even the times are present: leave this line alone
+		}
+		text := ""
+		if len(fields) == len(format) {
+			text = fields[len(fields)-1] // short (malformed) lines are still retimed, just not matched
 		}
 		st, ok1 := parseASSClock(fields[si])
 		en, ok2 := parseASSClock(fields[ei])
@@ -193,7 +205,7 @@ func (f *File) parseASS() error {
 			continue
 		}
 		f.entries = append(f.entries, entry{line: i, start: st, end: en, cue: isDialogue,
-			text: toUTF8(fields[len(fields)-1]), prefix: line[:colon+1], fields: fields, startF: si, endF: ei})
+			text: toUTF8(strings.TrimSuffix(text, "\r")), prefix: line[:colon+1], fields: fields, startF: si, endF: ei})
 	}
 	return nil
 }
@@ -242,6 +254,9 @@ func (f *File) Retime(fn func(start, end float64) (float64, float64)) int {
 		default:
 			line = fmtClock(ns, ",") + " --> " + fmtClock(ne, ",") + e.srtRest
 		}
+		if e.bom {
+			line = "\uFEFF" + line
+		}
 		if line != f.lines[e.line] {
 			changed++
 			f.lines[e.line] = line
@@ -250,7 +265,7 @@ func (f *File) Retime(fn func(start, end float64) (float64, float64)) int {
 	return changed
 }
 
-func (f *File) Bytes() []byte { return []byte(strings.Join(f.lines, f.nl)) }
+func (f *File) Bytes() []byte { return []byte(strings.Join(f.lines, "\n")) }
 
 // --- encoding ---------------------------------------------------------------
 

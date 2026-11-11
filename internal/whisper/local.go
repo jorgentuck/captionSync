@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -37,7 +39,7 @@ type Local struct {
 }
 
 func NewLocal(cfg *config.Config) *Local {
-	l := &Local{cfg: cfg, client: &http.Client{Timeout: 30 * time.Minute}}
+	l := &Local{cfg: cfg, client: &http.Client{Timeout: 3 * time.Hour}} // per-request deadlines come from ctx
 	go l.reaper()
 	return l
 }
@@ -182,6 +184,12 @@ func (l *Local) launch(ctx context.Context, bin string) error {
 		// sometimes seconds off, depending on tiny changes to the audio, so it is off by default.
 		args = append(args, "--vad", "-vm", l.vadPath())
 	}
+	// make sure the port is ours: otherwise the readiness probe could talk to someone else
+	if ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(l.cfg.WhisperPort)); err != nil {
+		return fmt.Errorf("port %d is already in use (set WHISPER_PORT to a free port): %w", l.cfg.WhisperPort, err)
+	} else {
+		ln.Close()
+	}
 	cmd := exec.Command(bin, args...)
 	logw := &prefixWriter{}
 	cmd.Stdout, cmd.Stderr = logw, logw
@@ -213,6 +221,11 @@ func (l *Local) launch(ctx context.Context, bin string) error {
 		resp, err := http.Get(l.url("/"))
 		if err == nil {
 			resp.Body.Close()
+			select {
+			case <-exited: // answered by something else, and ours died
+				return fmt.Errorf("exited during startup: %s", logw.tail())
+			default:
+			}
 			if resp.StatusCode == 200 {
 				l.cmd, l.exited = cmd, exited
 				return nil
@@ -264,28 +277,52 @@ func (l *Local) crashed() bool {
 	}
 }
 
-// Transcribe sends one chunk to the server. If the server dies (e.g. out of GPU memory or a
-// whisper.cpp crash), it is restarted and the chunk retried, so one crash doesn't fail the file.
+// kill forcibly ends a hung server; the next request starts a fresh one.
+func (l *Local) kill() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.cmd == nil {
+		return
+	}
+	l.stopping.Store(true)
+	_ = l.cmd.Process.Kill()
+	<-l.exited
+	l.cmd, l.device = nil, ""
+}
+
+// Transcribe sends one chunk to the server. If the server dies (out of GPU memory, a whisper.cpp
+// crash) or hangs, it is restarted and the chunk retried, so one bad moment doesn't fail the file.
+// Failures of the server itself are reported as ErrEngine.
 func (l *Local) Transcribe(ctx context.Context, pcm []byte, language string) (*Chunk, error) {
 	if language == "" {
 		language = "auto"
 	}
 	fields := [][2]string{
-		// Plain segments: their start times are accurate; per-word splitting (max_len=1) is not.
+		// Plain segments: their start times are what we use. max_len stops whisper.cpp from cutting
+		// long segments at 60 characters, which gives the extra pieces guessed mid-speech starts.
 		{"response_format", "verbose_json"}, {"temperature", "0.0"}, {"language", language},
+		{"max_len", "100000"},
 	}
+	audioSec := float64(len(pcm)) / (2 * 16000)
+	timeout := time.Duration(math.Max(120, 60+3*audioSec)) * time.Second
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		l.mu.Lock()
 		if err := l.start(ctx); err != nil {
 			l.mu.Unlock()
-			return nil, err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, fmt.Errorf("%w: %v", ErrEngine, err)
 		}
 		l.inflight++
 		l.lastUsed = time.Now()
 		l.mu.Unlock()
 
-		chunk, err := postTranscription(ctx, l.client, l.url("/inference"), nil, fields, pcm, 2)
+		rctx, cancel := context.WithTimeout(ctx, timeout)
+		chunk, err := postTranscription(rctx, l.client, l.url("/inference"), nil, fields, pcm, 2)
+		hung := rctx.Err() == context.DeadlineExceeded && ctx.Err() == nil
+		cancel()
 
 		l.mu.Lock()
 		l.inflight--
@@ -295,18 +332,26 @@ func (l *Local) Transcribe(ctx context.Context, pcm []byte, language string) (*C
 			return chunk, err
 		}
 		lastErr = err
-		if !l.crashed() {
-			return nil, err // a real error from a healthy server
+		switch {
+		case hung:
+			slog.Warn("whisper server did not answer in time; restarting it", "timeout", timeout, "attempt", attempt+1)
+			l.kill()
+		case l.crashed():
+			why, _ := l.lastExit.Load().(string)
+			slog.Warn("whisper server died during a request; restarting and retrying", "attempt", attempt+1, "why", why)
+		default:
+			return nil, err // an answer from a healthy server
 		}
-		why, _ := l.lastExit.Load().(string)
-		slog.Warn("whisper server died during a request; restarting and retrying", "attempt", attempt+1, "why", why)
 	}
 	why, _ := l.lastExit.Load().(string)
-	return nil, fmt.Errorf("whisper server keeps crashing on this audio (%v). Server said: %s", lastErr, why)
+	return nil, fmt.Errorf("%w: whisper server keeps failing (%v). Server said: %s", ErrEngine, lastErr, why)
 }
 
+// Status never blocks: while the model downloads or the server starts, it says so.
 func (l *Local) Status() map[string]any {
-	l.mu.Lock()
+	if !l.mu.TryLock() {
+		return map[string]any{"engine": "local", "model": l.cfg.WhisperModel, "loaded": false, "device": "starting"}
+	}
 	defer l.mu.Unlock()
 	return map[string]any{"engine": "local", "model": l.cfg.WhisperModel, "loaded": l.cmd != nil, "device": l.device}
 }

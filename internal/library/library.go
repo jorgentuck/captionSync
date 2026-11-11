@@ -30,14 +30,38 @@ func (l *Library) MapPath(p string) string {
 }
 
 // Allowed reports whether p lies inside one of the configured media roots.
+// Symlinks are resolved first, so a link inside a root can't lead outside it.
 func (l *Library) Allowed(p string) bool {
 	p = filepath.Clean(p)
+	if !within(p, l.cfg.MediaRoots) {
+		return false
+	}
+	real := resolve(p)
+	var roots []string
 	for _, r := range l.cfg.MediaRoots {
+		roots = append(roots, resolve(r))
+	}
+	return within(real, roots)
+}
+
+func within(p string, roots []string) bool {
+	for _, r := range roots {
 		if p == r || strings.HasPrefix(p, strings.TrimRight(r, "/")+"/") {
 			return true
 		}
 	}
 	return false
+}
+
+// resolve follows symlinks; for a path that doesn't exist yet it resolves the closest existing parent.
+func resolve(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	if parent := filepath.Dir(p); parent != p {
+		return filepath.Join(resolve(parent), filepath.Base(p))
+	}
+	return p
 }
 
 // Ignored matches the ignore patterns against the file name and every directory component.
@@ -89,22 +113,56 @@ func owner(subName string, videoStems []string) string {
 	return best
 }
 
+// videoPriority orders videos that share a name (Movie.mkv, Movie.mp4): only the first one owns
+// the shared subtitle files, so they are never retimed back and forth against two different videos.
+func videoPriority(name string) int {
+	switch ext(name) {
+	case ".mkv":
+		return 0
+	case ".mp4":
+		return 1
+	case ".m4v":
+		return 2
+	}
+	return 3
+}
+
+// videosByStem maps each video stem in dir to the one video that owns that stem's subtitles.
+func (l *Library) videosByStem(entries []os.DirEntry) map[string]string {
+	by := map[string]string{}
+	for _, e := range entries {
+		if e.IsDir() || !l.IsVideo(e.Name()) {
+			continue
+		}
+		st := stem(e.Name())
+		cur, ok := by[st]
+		if !ok || videoPriority(e.Name()) < videoPriority(cur) ||
+			(videoPriority(e.Name()) == videoPriority(cur) && e.Name() < cur) {
+			by[st] = e.Name()
+		}
+	}
+	return by
+}
+
 func (l *Library) Sidecars(video string) []string {
 	dir := filepath.Dir(video)
-	me := stem(filepath.Base(video))
+	me := filepath.Base(video)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
-	stems := []string{me}
-	for _, e := range entries {
-		if !e.IsDir() && l.IsVideo(e.Name()) {
-			stems = append(stems, stem(e.Name()))
-		}
+	by := l.videosByStem(entries)
+	if o, ok := by[stem(me)]; ok && o != me {
+		return nil // another video with the same name owns these subtitles
+	}
+	by[stem(me)] = me
+	stems := make([]string, 0, len(by))
+	for st := range by {
+		stems = append(stems, st)
 	}
 	var out []string
 	for _, e := range entries {
-		if !e.IsDir() && l.IsSubtitle(e.Name()) && owner(e.Name(), stems) == me {
+		if !e.IsDir() && l.IsSubtitle(e.Name()) && owner(e.Name(), stems) == stem(me) {
 			out = append(out, filepath.Join(dir, e.Name()))
 		}
 	}
@@ -119,16 +177,13 @@ func (l *Library) VideoForSubtitle(sub string) string {
 	if err != nil {
 		return ""
 	}
-	byStem := map[string]string{}
-	var stems []string
-	for _, e := range entries {
-		if !e.IsDir() && l.IsVideo(e.Name()) {
-			byStem[stem(e.Name())] = e.Name()
-			stems = append(stems, stem(e.Name()))
-		}
+	by := l.videosByStem(entries)
+	stems := make([]string, 0, len(by))
+	for st := range by {
+		stems = append(stems, st)
 	}
 	if o := owner(filepath.Base(sub), stems); o != "" {
-		return filepath.Join(dir, byStem[o])
+		return filepath.Join(dir, by[o])
 	}
 	return ""
 }

@@ -94,3 +94,73 @@ func TestNegativeClamped(t *testing.T) {
 		t.Fatalf("got %q", f.Bytes())
 	}
 }
+
+func identity(s, e float64) (float64, float64) { return s, e }
+
+// Round trip with no shift must reproduce the file byte for byte, whatever its quirks.
+func TestIdentityRoundTrip(t *testing.T) {
+	cases := map[string]string{
+		"mixed.srt":   "1\r\n00:00:01,000 --> 00:00:02,000\r\nCRLF line\n\n2\n00:00:03,000 --> 00:00:04,000\nLF line\n",
+		"nofinal.srt": "1\n00:00:01,000 --> 00:00:02,000\nno final newline",
+		"bomtime.srt": "\uFEFF00:00:01,000 --> 00:00:02,000\nfirst cue, no index\n\n00:00:03,000 --> 00:00:04,000\nsecond\n",
+		"crlf.ass":    "[Events]\r\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hi, there\r\n",
+	}
+	for name, src := range cases {
+		f, err := Load(write(t, name, []byte(src)))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		f.Retime(identity)
+		if got := string(f.Bytes()); got != src {
+			t.Errorf("%s: identity round trip changed bytes:\n got %q\nwant %q", name, got, src)
+		}
+	}
+}
+
+func TestBOMBeforeFirstTimingLineIsRetimed(t *testing.T) {
+	src := "\uFEFF00:00:01,000 --> 00:00:02,000\nfirst\n\n00:00:03,000 --> 00:00:04,000\nsecond\n"
+	f, err := Load(write(t, "b.srt", []byte(src)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Cues()) != 2 {
+		t.Fatalf("cues %d, want 2 (BOM hid the first)", len(f.Cues()))
+	}
+	f.Retime(plus(1))
+	if got := string(f.Bytes()); !strings.HasPrefix(got, "\uFEFF00:00:02,000 --> 00:00:03,000\n") {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestMixedLineEndingsPreservedWhenShifting(t *testing.T) {
+	src := "1\r\n00:00:01,000 --> 00:00:02,000\r\nA\r\n\r\n2\n00:00:03,000 --> 00:00:04,000\nB\n"
+	f, _ := Load(write(t, "m.srt", []byte(src)))
+	f.Retime(plus(1))
+	want := "1\r\n00:00:02,000 --> 00:00:03,000\r\nA\r\n\r\n2\n00:00:04,000 --> 00:00:05,000\nB\n"
+	if got := string(f.Bytes()); got != want {
+		t.Fatalf("got %q\nwant %q", got, want)
+	}
+}
+
+func TestUnpaddedMillisecondsAreMilliseconds(t *testing.T) {
+	f, _ := Load(write(t, "u.srt", []byte("1\n00:00:01,5 --> 00:00:02,50\nx\n")))
+	c := f.Cues()[0]
+	if c.Start != 1.005 || c.End != 2.05 {
+		t.Fatalf("got %v %v, want 1.005 2.05 (as ffmpeg/VLC read it)", c.Start, c.End)
+	}
+}
+
+func TestShortASSLineStillRetimed(t *testing.T) {
+	src := "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n" +
+		"Dialogue: 0,0:00:01.00,0:00:02.00,Default\n" + // malformed: too few fields
+		"Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,ok\n"
+	f, err := Load(write(t, "s.ass", []byte(src)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Retime(plus(1))
+	got := string(f.Bytes())
+	if !strings.Contains(got, "Dialogue: 0,0:00:02.00,0:00:03.00,Default\n") {
+		t.Fatalf("short line not retimed: %q", got)
+	}
+}

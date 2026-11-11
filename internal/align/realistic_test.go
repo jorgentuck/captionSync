@@ -172,3 +172,133 @@ func TestRealisticDriftAndJump(t *testing.T) {
 		t.Errorf("only %.0f%% within 300 ms: %s", acc*100, r.Message)
 	}
 }
+
+// --- regressions from the multi-agent review: every result must be correct or uncertain ---------
+
+// windowsOf builds 12 x 60 s sampled windows like the processor does.
+func windowsOf(dur float64) [][2]float64 {
+	m := math.Min(120, dur*0.03)
+	u := dur - 2*m - 60
+	var w [][2]float64
+	for i := 0; i < 12; i++ {
+		s := m + u*float64(i)/11
+		w = append(w, [2]float64{s, s + 60})
+	}
+	return w
+}
+
+func inWindows(w [][2]float64) func(float64) bool {
+	return func(t float64) bool {
+		for _, x := range w {
+			if t >= x[0] && t < x[1] {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// never: a written fix (needs_fix) must put at least `need` of the cues in `region` within tol.
+func checkRegion(t *testing.T, name string, sc *scene, r Result, region func(float64) bool, tol, need float64) bool {
+	if r.Status != "needs_fix" && r.Status != "in_sync" {
+		return true // uncertain (or escalation) is an acceptable answer
+	}
+	ok, n := 0, 0
+	for i, s := range sc.subsTimes {
+		if !region(sc.truth[i]) {
+			continue
+		}
+		n++
+		got := s
+		if r.Mapping != nil {
+			got, _ = r.Mapping.Apply(s, s+1)
+		}
+		if math.Abs(got-sc.truth[i]) <= tol {
+			ok++
+		}
+	}
+	if n > 0 && float64(ok)/float64(n) < need {
+		t.Errorf("%s: %s %q left %d/%d region cues within %.0f ms", name, r.Status, r.Message, ok, n, tol*1000)
+		return false
+	}
+	return true
+}
+
+func TestReviewColdOpen(t *testing.T) {
+	for seed := int64(1); seed <= 20; seed++ {
+		sc := &scene{cues: 420, yield: 0.3, noise: 0.2, outliers: 0.15, seed: seed,
+			subOf: func(a float64) float64 {
+				if a < 240 {
+					return a - 1.5
+				}
+				return a + 1.0
+			}}
+		r := run(sc, false)
+		checkRegion(t, "cold open", sc, r, func(a float64) bool { return a < 240 }, 0.3, 0.9)
+		checkRegion(t, "body", sc, r, func(a float64) bool { return a >= 300 }, 0.3, 0.9)
+	}
+}
+
+func TestReviewLateTail(t *testing.T) {
+	for seed := int64(1); seed <= 20; seed++ {
+		sc := &scene{cues: 1100, yield: 0.15, noise: 0.2, outliers: 0.15, seed: seed}
+		var cut float64
+		sc.subOf = func(a float64) float64 {
+			if cut > 0 && a > cut {
+				return a - 1.5
+			}
+			return a + 1.0
+		}
+		cut = 0.94 * (20 + 1100*5.5) // ~94% of the runtime
+		r := run(sc, false)
+		checkRegion(t, "tail", sc, r, func(a float64) bool { return a > cut+30 }, 0.3, 0.9)
+		checkRegion(t, "body", sc, r, func(a float64) bool { return a < cut-30 }, 0.3, 0.9)
+	}
+}
+
+func TestReviewSampledLateJumpEscalates(t *testing.T) {
+	for seed := int64(1); seed <= 20; seed++ {
+		sc := &scene{cues: 1300, yield: 0.15, noise: 0.2, outliers: 0.15, seed: seed}
+		dur := 20 + 1300*5.5
+		w := windowsOf(dur)
+		sc.speechOK = inWindows(w)
+		sc.subOf = func(a float64) float64 {
+			if a > 0.75*dur {
+				return a + 2.5
+			}
+			return a
+		}
+		cues, words := sc.build()
+		sort.Slice(cues, func(i, j int) bool { return cues[i].Start < cues[j].Start })
+		r := Analyze(cues, words, nil, w, dur, DefaultParams(), true)
+		if r.WantsFull {
+			continue // escalates to a full pass: correct behaviour
+		}
+		checkRegion(t, "sampled tail", sc, r, func(a float64) bool { return a > 0.75*dur+30 }, 0.3, 0.9)
+		checkRegion(t, "sampled body", sc, r, func(a float64) bool { return a < 0.75*dur-30 }, 0.3, 0.9)
+	}
+}
+
+func TestReviewExcursionIsNotAFix(t *testing.T) {
+	for seed := int64(1); seed <= 20; seed++ {
+		sc := &scene{cues: 900, yield: 0.2, noise: 0.2, outliers: 0.1, seed: seed,
+			subOf: func(a float64) float64 {
+				if a > 2000 && a < 2100 { // brief excursion that returns to the same offset
+					return a + 3.0
+				}
+				return a + 0.8
+			}}
+		r := run(sc, false)
+		checkRegion(t, "outside excursion", sc, r, func(a float64) bool { return a < 1950 || a > 2150 }, 0.3, 0.9)
+	}
+}
+
+func TestReviewZeroMinAnchorsDoesNotPanic(t *testing.T) {
+	p := DefaultParams()
+	p.MinAnchors = 0
+	_ = Analyze(nil, nil, nil, nil, 100, p, false)
+	_ = Analyze([]Cue{{Start: 1, End: 2, Tokens: []string{"hello", "there", "friend"}}}, nil, nil, nil, 100, p, false)
+	if m := FitMapping(nil, nil, nil, nil, p); m != nil {
+		t.Fatal("mapping from nothing")
+	}
+}

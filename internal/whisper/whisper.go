@@ -11,10 +11,12 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -33,7 +35,16 @@ type Word struct {
 type Chunk struct {
 	Words    []Word
 	Language string
+	// SegmentLevel: only segment start times came back (whisper.cpp, or an API without word
+	// timestamps). The first word of each segment carries the segment start, which still needs to
+	// be refined against the audio; the other words' times are rough.
+	SegmentLevel bool
 }
+
+// ErrEngine marks failures of the transcription engine itself (server won't start, keeps crashing,
+// hangs, API down) as opposed to problems with one file. Files hitting it are retried later
+// instead of being marked failed.
+var ErrEngine = errors.New("transcription engine unavailable")
 
 type Engine interface {
 	Name() string
@@ -89,15 +100,22 @@ type jsonWord = struct {
 	End   float64 `json:"end"`
 }
 
-// wordsInside reports whether word times are plausible for their segment. With VAD enabled,
-// whisper.cpp reports word times on the VAD-compressed timeline, so they must be ignored.
-func wordsInside(ws []jsonWord, start, end float64) bool {
-	for _, w := range ws {
-		if w.Start < start-1 || w.Start > end+1 {
-			return false
+var (
+	// non-speech annotations whisper emits: [BLANK_AUDIO], [Music], (laughs), *sighs*, ♪ ... ♪
+	nonSpeech = regexp.MustCompile(`\[[^\]]*\]|\([^)]*\)|\*[^*]*\*|♪[^♪]*♪?`)
+	hasWordRe = regexp.MustCompile(`[\p{L}\p{N}]`)
+)
+
+// segmentWords splits a segment's text into real words (no non-speech tags, no bare punctuation).
+// whisper.cpp's per-segment "words" are BPE tokens ("BL","ANK"...), so the text is used instead.
+func segmentWords(text string) []string {
+	var out []string
+	for _, w := range strings.Fields(nonSpeech.ReplaceAllString(text, " ")) {
+		if hasWordRe.MatchString(w) {
+			out = append(out, w)
 		}
 	}
-	return true
+	return out
 }
 
 // verboseJSON is the OpenAI "verbose_json" shape (whisper.cpp server uses the same).
@@ -115,28 +133,21 @@ type verboseJSON struct {
 
 func (v *verboseJSON) chunk() *Chunk {
 	c := &Chunk{Language: v.Language}
-	for _, w := range v.Words {
-		c.Words = append(c.Words, Word{w.Word, w.Start, w.End, true})
+	for _, w := range v.Words { // real word timestamps (OpenAI-style)
+		if hasWordRe.MatchString(w.Word) && !nonSpeech.MatchString(w.Word) {
+			c.Words = append(c.Words, Word{w.Word, w.Start, w.End, true})
+		}
 	}
 	if len(c.Words) > 0 {
 		return c
 	}
+	c.SegmentLevel = true
 	for _, s := range v.Segments {
-		if len(s.Words) > 0 && wordsInside(s.Words, s.Start, s.End) {
-			for i, w := range s.Words {
-				st := w.Start
-				if i == 0 {
-					st = s.Start
-				}
-				c.Words = append(c.Words, Word{w.Word, st, w.End, i == 0})
-			}
+		toks := segmentWords(s.Text)
+		if len(toks) == 0 || s.End <= s.Start {
 			continue
 		}
-		// no word timings: spread the segment's words evenly over it
-		toks := strings.Fields(s.Text)
-		if len(toks) == 0 {
-			continue
-		}
+		// the segment start is the only timestamp we use; inner words are spread evenly
 		step := (s.End - s.Start) / float64(len(toks))
 		for i, t := range toks {
 			st := s.Start + float64(i)*step
@@ -181,7 +192,12 @@ func postTranscription(ctx context.Context, client *http.Client, url string, hea
 			continue
 		}
 		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(data), 300))
+			err := fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(data), 300))
+			switch resp.StatusCode {
+			case 400, 413, 415, 422: // this request (this audio) was rejected
+				return nil, err
+			}
+			return nil, fmt.Errorf("%w: %v", ErrEngine, err) // auth, missing model, ...: affects every file
 		}
 		var v verboseJSON
 		if err := json.Unmarshal(data, &v); err != nil {
@@ -189,7 +205,10 @@ func postTranscription(ctx context.Context, client *http.Client, url string, hea
 		}
 		return v.chunk(), nil
 	}
-	return nil, fmt.Errorf("transcription failed: %w", lastErr)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return nil, fmt.Errorf("%w: transcription failed: %v", ErrEngine, lastErr)
 }
 
 func truncate(s string, n int) string {

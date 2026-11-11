@@ -47,3 +47,36 @@ func TestRefineNoContrast(t *testing.T) {
 		t.Fatal("found an onset in pure noise")
 	}
 }
+
+// review: a noisy gap between two lines must not let the back-up walk into the previous line
+func TestRefineDoesNotWalkIntoPreviousLine(t *testing.T) {
+	d := New(synth(0.02, [][2]float64{{3.0, 4.0}, {4.6, 6.0}}, 9))
+	got, ok := d.Refine(4.1, 7.0)
+	if ok && math.Abs(got-4.6) > 0.06 {
+		t.Fatalf("got %.3f, want ~4.6 or not ok", got)
+	}
+}
+
+// review: whisper start inside running speech -> don't jump to the next phrase
+func TestRefineInsideSpeechIsNotOK(t *testing.T) {
+	d := New(synth(0.02, [][2]float64{{1.0, 5.0}, {6.0, 8.0}}, 10))
+	if got, ok := d.Refine(3.0, 9.0); ok {
+		t.Fatalf("returned %.3f ok inside running speech", got)
+	}
+}
+
+// review: a short transient (click/music hit) before the line is not the onset
+func TestRefineIgnoresShortTransient(t *testing.T) {
+	d := New(synth(0.02, [][2]float64{{2.0, 2.06}, {3.5, 5.5}}, 8))
+	if got, ok := d.Refine(1.0, 7.0); !ok || math.Abs(got-3.5) > 0.06 {
+		t.Fatalf("got %.3f ok=%v, want ~3.5", got, ok)
+	}
+}
+
+// review: line after a long silence (whisper's start at the previous line's end, > 4 s early)
+func TestRefineAfterLongSilence(t *testing.T) {
+	d := New(synth(0.02, [][2]float64{{1.0, 2.0}, {9.0, 11.0}}, 14))
+	if got, ok := d.Refine(2.1, 13.0); !ok || math.Abs(got-9.0) > 0.06 {
+		t.Fatalf("got %.3f ok=%v, want ~9.0", got, ok)
+	}
+}

@@ -3,6 +3,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -41,20 +42,48 @@ type Outcome struct {
 	OffsetMs  *int64
 	Details   map[string]any
 	Signature string
+	// Requeue: nothing final was decided (files changed underneath us, or the engine is down);
+	// check this file again later instead of recording a result.
+	Requeue bool
+	// EngineDown: the transcription engine itself failed; workers should back off.
+	EngineDown bool
 }
 
 type track struct {
 	name     string // shown in the UI
 	path     string // sidecar file, or the extracted copy of an embedded track
 	embedded *media.SubStream
+	dst      string // EMBEDDED_SUBS=sidecar: where the fixed copy is written
+	stamp    stamp  // sidecar size/mtime when it was read
 	file     *subtitle.File
 	cues     []align.Cue
 	result   align.Result
 	written  bool
 	changed  int
 	err      string
-	short    bool
+	short    bool // too few lines: skipped, not an error
+	broken   bool // could not be read/parsed
 }
+
+// stamp identifies a file version cheaply (size + modification time).
+type stamp struct {
+	size int64
+	mod  time.Time
+	ok   bool
+}
+
+func stampOf(p string) stamp {
+	st, err := os.Stat(p)
+	if err != nil {
+		return stamp{}
+	}
+	return stamp{st.Size(), st.ModTime(), true}
+}
+
+func (a stamp) same(b stamp) bool { return a.ok == b.ok && a.size == b.size && a.mod.Equal(b.mod) }
+
+// errChanged: a file we were about to replace changed after we read it (Bazarr/Sonarr/Radarr).
+var errChanged = errors.New("changed while it was being analysed")
 
 type transcript struct {
 	words    []align.Word
@@ -76,13 +105,20 @@ func (p *Processor) params() align.Params {
 }
 
 // Process checks the subtitles of one video and fixes the ones that are out of sync.
+//
+// Nothing is written unless every file involved is still exactly as it was when it was read:
+// a subtitle Bazarr replaced, or a video Sonarr/Radarr upgraded mid-run, sends the file back to
+// the queue instead of being overwritten with stale content.
 func (p *Processor) Process(ctx context.Context, path string, progress func(string)) Outcome {
 	started := time.Now()
 	sigBefore := p.lib.Signature(path)
 	if sigBefore == "" {
 		return Outcome{Status: store.Missing, Message: "File no longer exists"}
 	}
+	videoStamp := stampOf(path)
+	sidecarList := p.lib.Sidecars(path)
 	out := Outcome{Signature: sigBefore, Details: map[string]any{}}
+	p.cleanStaleTemps(path)
 
 	progress("probing")
 	pr, err := media.ProbeFile(ctx, path)
@@ -93,7 +129,7 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 
 	// 1. collect subtitle tracks: sidecar files, plus embedded text tracks when enabled
 	var tracks []*track
-	for _, sp := range p.lib.Sidecars(path) {
+	for _, sp := range sidecarList {
 		tracks = append(tracks, &track{name: filepath.Base(sp), path: sp})
 	}
 	var embText, embImage []media.SubStream
@@ -113,15 +149,16 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 		}
 		defer os.RemoveAll(tmp)
 		progress("extracting embedded subtitles")
+		dsts := embeddedSidecarPaths(path, embText)
 		var ex []media.Extract
 		for i := range embText {
 			ss := embText[i]
 			if p.cfg.EmbeddedMode == "sidecar" {
-				if _, err := os.Stat(embeddedSidecarPath(path, &ss)); err == nil {
+				if _, err := os.Stat(dsts[ss.Index]); err == nil {
 					continue // exported on an earlier run; that sidecar is checked like any other
 				}
 			}
-			t := &track{name: "embedded " + ss.Label(), embedded: &ss,
+			t := &track{name: "embedded " + ss.Label(), embedded: &ss, dst: dsts[ss.Index],
 				path: filepath.Join(tmp, fmt.Sprintf("s%d.%s", ss.Index, ss.Format))}
 			tracks = append(tracks, t)
 			ex = append(ex, media.Extract{Rel: ss.Rel, Format: ss.Format, Out: t.path})
@@ -147,9 +184,13 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 	}
 
 	for _, t := range tracks {
+		if t.embedded == nil {
+			t.stamp = stampOf(t.path)
+		}
 		f, err := subtitle.Load(t.path)
 		if err != nil {
-			t.err = err.Error()
+			t.err = "could not read: " + err.Error()
+			t.broken = true
 			continue
 		}
 		t.file = f
@@ -184,30 +225,52 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 	if audio < 0 || dur <= 0 {
 		return fail(out, fmt.Errorf("no audio stream / unknown duration"))
 	}
+	delay := pr.AudioDelay(audio)
 	sampled := p.cfg.AnalysisMode != "full"
-	tr, err := p.transcribe(ctx, path, audio, dur, sampled, progress)
+	tr, err := p.transcribe(ctx, path, audio, dur, delay, sampled, progress)
 	if err != nil {
 		return fail(out, err)
 	}
 	p.analyse(tracks, tr, dur, progress)
-	if tr.sampled && p.cfg.AutoFull && wantsFull(tracks) {
-		slog.Info("sampled analysis inconclusive, running full pass", "path", path)
-		if full, err := p.transcribe(ctx, path, audio, dur, false, progress); err == nil {
-			tr = full
-			p.analyse(tracks, tr, dur, progress)
-		} else if ctx.Err() != nil {
-			return fail(out, err)
-		} else {
-			slog.Warn("full pass failed, keeping sampled result", "err", err)
+	if tr.sampled && wantsFull(tracks) {
+		why := "AUTO_FULL is off"
+		if p.cfg.AutoFull {
+			slog.Info("sampled analysis not conclusive, running full pass", "path", path)
+			full, err := p.transcribe(ctx, path, audio, dur, delay, false, progress)
+			switch {
+			case err == nil:
+				tr = full
+				p.analyse(tracks, tr, dur, progress)
+			case ctx.Err() != nil || errors.Is(err, whisper.ErrEngine):
+				return fail(out, err)
+			default:
+				why = "the full pass failed: " + err.Error()
+			}
+		}
+		// a sampled result that asked for a full pass is never written
+		for _, t := range tracks {
+			if t.err == "" && tr.sampled && t.result.WantsFull {
+				t.result.Status = "uncertain"
+				t.result.Message += " - needs a full analysis (" + why + "), left unchanged"
+			}
 		}
 	}
 
-	// 3. write fixes
+	// 3. write fixes - only if nothing changed underneath us
+	if !p.cfg.DryRun && needsWrite(tracks) {
+		if what := p.changedSince(path, videoStamp, sidecarList, tracks, nil); what != "" {
+			return requeue(out, what)
+		}
+	}
 	var fixed, uncertain, failed int
 	var firstShift *int64
 	remux := map[int]string{}
 	var remuxTracks []*track
 	for _, t := range tracks {
+		if t.broken {
+			failed++
+			continue
+		}
 		if t.err != "" {
 			continue
 		}
@@ -223,7 +286,11 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 			}
 			progress("writing " + t.name)
 			if p.cfg.Backup && t.embedded != nil {
-				_ = p.backup(path+fmt.Sprintf(".track%d.%s", t.embedded.Index, t.embedded.Format), t.path)
+				if err := p.backup(path+fmt.Sprintf(".track%d.%s", t.embedded.Index, t.embedded.Format), t.path); err != nil {
+					t.err = "not written, backup failed: " + err.Error()
+					failed++
+					continue
+				}
 			}
 			t.changed = t.file.Retime(t.result.Mapping.Apply)
 			var err error
@@ -239,6 +306,9 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 					continue
 				}
 			}
+			if errors.Is(err, errChanged) {
+				return requeue(out, t.name+" "+errChanged.Error())
+			}
 			if err != nil {
 				t.err = "write failed: " + err.Error()
 				failed++
@@ -250,9 +320,13 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 			uncertain++
 		}
 	}
+	remuxed := false
 	if len(remux) > 0 {
 		progress("remuxing video with corrected subtitles")
-		err := p.remuxVideo(ctx, path, pr, remux)
+		err := p.remuxVideo(ctx, path, pr, remux, videoStamp)
+		if errors.Is(err, errChanged) {
+			return requeue(out, "the video "+errChanged.Error())
+		}
 		for _, t := range remuxTracks {
 			if err != nil {
 				t.err = "remux failed: " + err.Error()
@@ -262,13 +336,31 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 				fixed++
 			}
 		}
+		remuxed = err == nil
 	}
 
 	out.OffsetMs = firstShift
-	out.Signature = p.lib.Signature(path) // includes our own rewrites, so they don't re-trigger
+	// The stored signature must never hide a change someone else made during the run: keep the
+	// pre-run one if we wrote nothing; after writing, only accept the new one if everything we
+	// did not write is still as we read it.
+	out.Signature = sigBefore
+	if anyWritten(tracks) {
+		var mine []string
+		for _, t := range tracks {
+			if t.written && t.dst != "" {
+				mine = append(mine, t.dst)
+			}
+		}
+		if p.changedSince(path, map[bool]stamp{true: {}, false: videoStamp}[remuxed], sidecarList, tracks, mine) == "" {
+			out.Signature = p.lib.Signature(path)
+		} else {
+			out.Signature = "" // something else changed too: let the next scan/watch event re-check it
+		}
+	}
 	out.Details["tracks"] = trackDetails(tracks)
 	out.Details["duration_s"] = math.Round(dur)
 	out.Details["audio_language"] = tr.language
+	out.Details["audio_delay_s"] = math.Round(delay*1000) / 1000
 	out.Details["analysis"] = map[bool]string{true: "sample", false: "full"}[tr.sampled]
 	out.Details["audio_analysed_s"] = math.Round(tr.seconds)
 	out.Details["elapsed_s"] = math.Round(time.Since(started).Seconds()*10) / 10
@@ -301,6 +393,60 @@ func (p *Processor) Process(ctx context.Context, path string, progress func(stri
 	return out
 }
 
+func needsWrite(tracks []*track) bool {
+	for _, t := range tracks {
+		if t.err == "" && t.result.Status == "needs_fix" {
+			return true
+		}
+	}
+	return false
+}
+
+func anyWritten(tracks []*track) bool {
+	for _, t := range tracks {
+		if t.written {
+			return true
+		}
+	}
+	return false
+}
+
+// changedSince reports (as a description) anything that differs from what was read at the start:
+// the video (unless videoStamp is zero = we replaced it ourselves), the set of sidecar files
+// (ignoring `mine`, files we created), and every sidecar we did not write ourselves.
+func (p *Processor) changedSince(video string, videoStamp stamp, sidecars []string, tracks []*track, mine []string) string {
+	if videoStamp.ok && !stampOf(video).same(videoStamp) {
+		return "the video " + errChanged.Error()
+	}
+	now := map[string]bool{}
+	for _, s := range p.lib.Sidecars(video) {
+		now[s] = true
+	}
+	for _, s := range mine {
+		delete(now, s)
+	}
+	if len(now) != len(sidecars) {
+		return "subtitle files were added or removed during the analysis"
+	}
+	for _, s := range sidecars {
+		if !now[s] {
+			return "subtitle files were added or removed during the analysis"
+		}
+	}
+	for _, t := range tracks {
+		if t.embedded == nil && !t.written && !stampOf(t.path).same(t.stamp) {
+			return t.name + " " + errChanged.Error()
+		}
+	}
+	return ""
+}
+
+func requeue(out Outcome, why string) Outcome {
+	out.Requeue = true
+	out.Message = why + "; checking it again"
+	return out
+}
+
 func labels(ss []media.SubStream) string {
 	var l []string
 	for _, s := range ss {
@@ -322,6 +468,10 @@ func embeddedInfo(text, image []media.SubStream) []map[string]any {
 
 func fail(out Outcome, err error) Outcome {
 	out.Status, out.Message = store.Failed, err.Error()
+	if errors.Is(err, whisper.ErrEngine) {
+		// not this file's fault: try it again once the engine is back
+		out.Requeue, out.EngineDown = true, true
+	}
 	return out
 }
 
@@ -387,7 +537,10 @@ type pcmChunk struct {
 	err           error
 }
 
-func (p *Processor) transcribe(ctx context.Context, path string, audio int, dur float64, sampled bool,
+// transcribe listens to the windows (sampled) or the whole file in chunks. delay is the audio
+// stream's start delay: ffmpeg's PCM for a window that begins before the audio does starts at
+// the audio's first sample, not at the window start.
+func (p *Processor) transcribe(ctx context.Context, path string, audio int, dur, delay float64, sampled bool,
 	progress func(string)) (*transcript, error) {
 	wins := windows(dur, sampled, p.cfg.SampleWindows, p.cfg.SampleWindowSec, p.cfg.FullChunkSec)
 	tr := &transcript{sampled: sampled && len(wins) == p.cfg.SampleWindows && dur > float64(p.cfg.SampleWindows*p.cfg.SampleWindowSec)*1.2}
@@ -430,25 +583,21 @@ func (p *Processor) transcribe(ctx context.Context, path string, audio int, dur 
 		if err != nil {
 			return nil, err
 		}
+		start := math.Max(c.start, delay) // where PCM sample 0 really is
 		actual := float64(len(c.pcm)) / (2 * media.SampleRate)
-		tr.spans = append(tr.spans, [2]float64{c.start, c.start + actual})
+		tr.spans = append(tr.spans, [2]float64{start, start + actual})
 		tr.seconds += actual
-		var words []whisper.Word
-		for _, w := range res.Words {
-			if t := strings.TrimSpace(w.Text); t != "" && !strings.HasPrefix(t, "[") { // [BLANK_AUDIO], [Music]
-				words = append(words, w)
-			}
-		}
-		if p.engine.Name() == "local" {
+		words := res.Words
+		if res.SegmentLevel {
 			refineStarts(words, c.pcm, actual)
 		}
 		for _, w := range words {
-			tr.words = append(tr.words, align.Word{Text: w.Text, Start: c.start + w.Start, End: c.start + w.End,
+			tr.words = append(tr.words, align.Word{Text: w.Text, Start: start + w.Start, End: start + w.End,
 				Reliable: w.Reliable})
 		}
 		// lock the language once detected so every window is transcribed consistently
 		if lang == "" && res.Language != "" && len(res.Words) >= 20 {
-			lang = res.Language
+			lang = config.NormalizeLang(res.Language)
 		}
 	}
 	tr.language = lang
@@ -471,6 +620,37 @@ func speechSpans(words []align.Word) [][2]float64 {
 	return out
 }
 
+// refineStarts replaces whisper's segment start times (often in the silence before a line, up to
+// seconds early) with the speech onset measured in the audio. The segment's other words move with
+// it, so the text stays in time order. A segment whose onset can't be found clearly is no longer
+// treated as a trustworthy timing anchor.
+func refineStarts(words []whisper.Word, pcm []byte, length float64) {
+	det := onset.New(pcm)
+	var idx []int
+	for i, w := range words {
+		if w.Reliable {
+			idx = append(idx, i)
+		}
+	}
+	for k, i := range idx {
+		until, next := length, len(words)
+		if k+1 < len(idx) {
+			until, next = words[idx[k+1]].Start, idx[k+1]
+		}
+		t, ok := det.Refine(words[i].Start, until)
+		// an onset right at the chunk's first moment means the chunk opened mid-sentence
+		if !ok || t < 0.3 {
+			words[i].Reliable = false
+			continue
+		}
+		shift := t - words[i].Start
+		for j := i; j < next; j++ {
+			words[j].Start = math.Min(words[j].Start+shift, until-0.01)
+			words[j].End = math.Min(words[j].End+shift, until)
+		}
+	}
+}
+
 // --- writing ---------------------------------------------------------------
 
 func (p *Processor) tmpRoot() string {
@@ -479,14 +659,28 @@ func (p *Processor) tmpRoot() string {
 	return d
 }
 
+// cleanStaleTemps removes our own leftover temp files next to this video (from a crash or a
+// killed container). Only files older than 6 hours, so a remux in progress is never touched.
+func (p *Processor) cleanStaleTemps(video string) {
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(video), ".*.captionsync.tmp*"))
+	for _, m := range matches {
+		if st, err := os.Stat(m); err == nil && time.Since(st.ModTime()) > 6*time.Hour {
+			if os.Remove(m) == nil {
+				slog.Info("removed stale temp file", "path", m)
+			}
+		}
+	}
+}
+
 // backup copies src into /config/backups/<date>/<name>.<time>.
 func (p *Processor) backup(name, src string) error {
 	orig, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	bp := filepath.Join(p.cfg.ConfigDir, "backups", time.Now().Format("2006-01-02"),
-		strings.TrimPrefix(name, "/")+"."+time.Now().Format("150405"))
+	now := time.Now()
+	bp := filepath.Join(p.cfg.ConfigDir, "backups", now.Format("2006-01-02"),
+		strings.TrimPrefix(name, "/")+"."+now.Format("150405.000000000"))
 	if err := os.MkdirAll(filepath.Dir(bp), 0o755); err != nil {
 		return fmt.Errorf("backup: %w", err)
 	}
@@ -504,18 +698,49 @@ func matchOwner(tmp string, ref os.FileInfo) {
 	}
 }
 
-// atomicWrite writes data next to dst and renames it over dst.
-func atomicWrite(dst string, data []byte, ref os.FileInfo) error {
+func syncFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func syncDir(dir string) {
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
+}
+
+// atomicWrite writes data next to dst, flushes it to disk and renames it over dst. If check is
+// given, it runs right before the rename and can veto it (e.g. dst changed meanwhile).
+func atomicWrite(dst string, data []byte, ref os.FileInfo, check func() error) error {
 	tmp := filepath.Join(filepath.Dir(dst), "."+filepath.Base(dst)+".captionsync.tmp")
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		os.Remove(tmp)
 		return err
 	}
+	if err := syncFile(tmp); err != nil {
+		os.Remove(tmp)
+		return err
+	}
 	matchOwner(tmp, ref)
+	if check != nil {
+		if err := check(); err != nil {
+			os.Remove(tmp)
+			return err
+		}
+	}
 	if err := os.Rename(tmp, dst); err != nil {
 		os.Remove(tmp)
 		return err
 	}
+	syncDir(filepath.Dir(dst))
 	return nil
 }
 
@@ -524,41 +749,63 @@ func (p *Processor) writeSidecar(t *track) error {
 	if err != nil {
 		return err
 	}
+	unchanged := func() error {
+		if !stampOf(t.path).same(t.stamp) {
+			return errChanged
+		}
+		return nil
+	}
+	if err := unchanged(); err != nil {
+		return err
+	}
 	if p.cfg.Backup {
 		if err := p.backup(t.path, t.path); err != nil {
 			return err
 		}
 	}
-	return atomicWrite(t.path, t.file.Bytes(), st)
+	return atomicWrite(t.path, t.file.Bytes(), st, unchanged)
 }
 
-// embeddedSidecarPath is where EMBEDDED_SUBS=sidecar writes a fixed embedded track,
-// e.g. "Movie.eng.forced.srt".
-func embeddedSidecarPath(video string, ss *media.SubStream) string {
+// embeddedSidecarPaths names the files EMBEDDED_SUBS=sidecar writes for each embedded text track,
+// e.g. "Movie.eng.forced.srt". Tracks that would share a name get ".track<N>" added.
+func embeddedSidecarPaths(video string, tracks []media.SubStream) map[int]string {
 	stem := strings.TrimSuffix(video, filepath.Ext(video))
-	lang := ss.Language()
-	if lang == "" {
-		lang = "und"
+	out := map[int]string{}
+	used := map[string]bool{}
+	for _, ss := range tracks {
+		lang := ss.Language()
+		if lang == "" {
+			lang = "und"
+		}
+		name := stem + "." + lang
+		if ss.Disposition["forced"] == 1 {
+			name += ".forced"
+		} else if ss.Disposition["hearing_impaired"] == 1 {
+			name += ".sdh"
+		}
+		if used[name] {
+			name += fmt.Sprintf(".track%d", ss.Index)
+		}
+		used[name] = true
+		out[ss.Index] = name + "." + ss.Format
 	}
-	name := stem + "." + lang
-	if ss.Disposition["forced"] == 1 {
-		name += ".forced"
-	} else if ss.Disposition["hearing_impaired"] == 1 {
-		name += ".sdh"
-	}
-	return name + "." + ss.Format
+	return out
 }
 
 func (p *Processor) writeEmbeddedAsSidecar(video string, t *track) error {
-	dst := embeddedSidecarPath(video, t.embedded)
-	if _, err := os.Stat(dst); err == nil {
-		return fmt.Errorf("%s already exists", filepath.Base(dst))
+	if _, err := os.Stat(t.dst); err == nil {
+		return fmt.Errorf("%s already exists", filepath.Base(t.dst))
 	}
 	st, err := os.Stat(video)
 	if err != nil {
 		return err
 	}
-	return atomicWrite(dst, t.file.Bytes(), st)
+	return atomicWrite(t.dst, t.file.Bytes(), st, func() error {
+		if _, err := os.Stat(t.dst); err == nil {
+			return errChanged // someone created it meanwhile
+		}
+		return nil
+	})
 }
 
 func freeBytes(dir string) uint64 {
@@ -570,11 +817,15 @@ func freeBytes(dir string) uint64 {
 }
 
 // remuxVideo rewrites the video with corrected embedded subtitles. All other streams are copied
-// untouched; the new file is verified before it replaces the original.
-func (p *Processor) remuxVideo(ctx context.Context, video string, pr *media.Probe, repl map[int]string) error {
+// untouched; the new file is verified before it replaces the original, and nothing is replaced if
+// the video differs from the version that was analysed (videoStamp).
+func (p *Processor) remuxVideo(ctx context.Context, video string, pr *media.Probe, repl map[int]string, videoStamp stamp) error {
 	st, err := os.Stat(video)
 	if err != nil {
 		return err
+	}
+	if !stampOf(video).same(videoStamp) {
+		return errChanged
 	}
 	dir := filepath.Dir(video)
 	if need := uint64(float64(st.Size()) * 1.05); freeBytes(dir) < need {
@@ -586,35 +837,16 @@ func (p *Processor) remuxVideo(ctx context.Context, video string, pr *media.Prob
 	if err := media.Remux(ctx, video, pr, repl, tmp); err != nil {
 		return err
 	}
-	if cur, err := os.Stat(video); err != nil || cur.Size() != st.Size() || !cur.ModTime().Equal(st.ModTime()) {
-		return fmt.Errorf("video changed while remuxing, not replacing it")
+	if err := syncFile(tmp); err != nil {
+		return err
+	}
+	if !stampOf(video).same(videoStamp) {
+		return errChanged
 	}
 	matchOwner(tmp, st)
-	return os.Rename(tmp, video)
-}
-
-// refineStarts replaces whisper's segment start times (often in the silence before a line, up to
-// seconds early) with the speech onset measured in the audio. A segment whose onset can't be
-// found clearly is no longer treated as a trustworthy timing anchor.
-func refineStarts(words []whisper.Word, pcm []byte, length float64) {
-	det := onset.New(pcm)
-	var idx []int
-	for i, w := range words {
-		if w.Reliable {
-			idx = append(idx, i)
-		}
+	if err := os.Rename(tmp, video); err != nil {
+		return err
 	}
-	for k, i := range idx {
-		until := length
-		if k+1 < len(idx) {
-			until = words[idx[k+1]].Start
-		}
-		t, ok := det.Refine(words[i].Start, until)
-		// an onset right at the chunk's first moment means the chunk opened mid-sentence
-		if !ok || t < 0.3 {
-			words[i].Reliable = false
-			continue
-		}
-		words[i].Start = t
-	}
+	syncDir(dir)
+	return nil
 }

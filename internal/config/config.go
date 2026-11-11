@@ -140,6 +140,25 @@ func max(a, b int) int {
 	return b
 }
 
+// iso639_2 maps the 3-letter codes found in video files to whisper's 2-letter codes.
+var iso639_2 = map[string]string{
+	"eng": "en", "ger": "de", "deu": "de", "fre": "fr", "fra": "fr", "spa": "es", "ita": "it", "jpn": "ja",
+	"por": "pt", "rus": "ru", "chi": "zh", "zho": "zh", "kor": "ko", "dut": "nl", "nld": "nl", "swe": "sv",
+	"nor": "no", "nob": "no", "dan": "da", "fin": "fi", "pol": "pl", "tur": "tr", "ara": "ar", "hin": "hi",
+	"heb": "he", "cze": "cs", "ces": "cs", "gre": "el", "ell": "el", "hun": "hu", "rum": "ro", "ron": "ro",
+	"ukr": "uk", "vie": "vi", "tha": "th", "ind": "id", "may": "ms", "msa": "ms", "cat": "ca", "bul": "bg",
+	"hrv": "hr", "srp": "sr", "slv": "sl", "slo": "sk", "slk": "sk", "per": "fa", "fas": "fa", "ice": "is", "isl": "is",
+}
+
+// NormalizeLang turns "eng"/"English"/"EN" into whisper's "en"; unknown values pass through.
+func NormalizeLang(l string) string {
+	l = strings.ToLower(strings.TrimSpace(l))
+	if v, ok := iso639_2[l]; ok {
+		return v
+	}
+	return l
+}
+
 // Load builds the configuration from the environment.
 func Load() *Config {
 	roots := cleanPaths(list("MEDIA_ROOTS", []string{"/media"}))
@@ -157,7 +176,7 @@ func Load() *Config {
 		WhisperVADModel: str("WHISPER_VAD_MODEL", "silero-v5.1.2"),
 		WhisperBinDir:   str("WHISPER_BIN_DIR", "/usr/local/bin"),
 		WhisperPort:     integer("WHISPER_PORT", 8178),
-		AudioLanguage:   str("AUDIO_LANGUAGE", ""),
+		AudioLanguage:   NormalizeLang(str("AUDIO_LANGUAGE", "")),
 		ModelIdleUnload: time.Duration(integer("MODEL_IDLE_UNLOAD", 300)) * time.Second,
 		OpenAIBaseURL:   strings.TrimRight(str("OPENAI_BASE_URL", "https://api.openai.com/v1"), "/"),
 		OpenAIKey:       str("OPENAI_API_KEY", ""),

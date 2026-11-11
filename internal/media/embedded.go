@@ -143,8 +143,21 @@ func Remux(ctx context.Context, src string, p *Probe, replacements map[int]strin
 	if err != nil {
 		return fmt.Errorf("probe remuxed file: %w", err)
 	}
-	if len(np.Streams) != outI {
-		return fmt.Errorf("remux produced %d streams, expected %d", len(np.Streams), outI)
+	// compare per stream type: the mp4 muxer may recreate chapter/timecode tracks we skipped
+	count := func(ss []Stream, mp4Data bool) map[string]int {
+		c := map[string]int{}
+		for _, s := range ss {
+			if s.CodecType == "video" || s.CodecType == "audio" || s.CodecType == "subtitle" || (!mp4Data && s.CodecType == "attachment") {
+				c[s.CodecType]++
+			}
+		}
+		return c
+	}
+	want, got := count(p.Streams, mp4), count(np.Streams, mp4)
+	for k, v := range want {
+		if got[k] != v {
+			return fmt.Errorf("remux produced %d %s streams, expected %d", got[k], k, v)
+		}
 	}
 	if d0, d1 := p.Duration(), np.Duration(); d0 > 0 && math.Abs(d0-d1) > math.Max(2, d0*0.01) {
 		return fmt.Errorf("remux duration mismatch (%.1fs vs %.1fs)", d0, d1)

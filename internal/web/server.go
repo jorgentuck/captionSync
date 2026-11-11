@@ -65,12 +65,20 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, 200, map[string]bool{"paused": false})
 	})
 	mux.HandleFunc("POST /api/hooks/{source}", s.hook)
-	mux.HandleFunc("GET /api/hooks/{source}", s.hook)
 	return logRequests(mux)
 }
 
 func logRequests(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Cross-site request protection for the UI's actions: they must be JSON requests, which a
+		// page on another site can't send here without a CORS preflight we never approve. Hooks
+		// (Bazarr/Tdarr, curl) are exempt; they only queue a single file.
+		if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/") &&
+			!strings.HasPrefix(r.URL.Path, "/api/hooks/") &&
+			!strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+			writeErr(w, http.StatusUnsupportedMediaType, errors.New("send application/json"))
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/api/") && r.Method != http.MethodGet {
 			slog.Info("api", "method", r.Method, "path", r.URL.Path)
 		}
@@ -161,9 +169,13 @@ func (s *Server) process(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := filepath.Clean(s.lib.MapPath(req.Path))
+	if !s.lib.Allowed(p) { // before touching the filesystem: don't reveal what exists elsewhere
+		writeErr(w, 400, pipeline.ErrNotAllowed)
+		return
+	}
 	st, err := os.Stat(p)
 	if err != nil {
-		writeErr(w, 404, err)
+		writeErr(w, 404, errors.New("not found"))
 		return
 	}
 	if st.IsDir() {
@@ -257,7 +269,7 @@ func (s *Server) hook(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errors.New("no file path supplied (use path, file, episode or subtitles)"))
 		return
 	}
-	res, err := s.svc.EnqueueFile(path, "hook:"+r.PathValue("source"), false, store.PriorityNow)
+	res, err := s.svc.EnqueueFile(s.lib.MapPath(path), "hook:"+r.PathValue("source"), false, store.PriorityNow)
 	if err != nil {
 		writeErr(w, 400, err)
 		return

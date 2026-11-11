@@ -31,6 +31,7 @@ func main() {
 	_ = level.UnmarshalText([]byte(cfg.LogLevel))
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
 
+	_ = os.RemoveAll(filepath.Join(cfg.ConfigDir, "tmp")) // job scratch dirs left by a crash
 	if err := os.MkdirAll(cfg.ConfigDir, 0o755); err != nil {
 		slog.Error("config dir", "err", err)
 		os.Exit(1)
@@ -95,5 +96,9 @@ func main() {
 		"engine", engine.Name(), "workers", cfg.Workers, "dry_run", cfg.DryRun)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("http server", "err", err)
+		stop()
 	}
+	<-ctx.Done()
+	svc.Wait(30 * time.Second) // let writes/remuxes finish or clean up before the engine stops
+	_ = os.RemoveAll(filepath.Join(cfg.ConfigDir, "tmp"))
 }

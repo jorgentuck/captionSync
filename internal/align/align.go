@@ -120,6 +120,12 @@ type Mapping struct {
 	AnchorsUsed int     `json:"anchors_used"`
 	ResidualMs  float64 `json:"residual_ms"`
 	Confidence  float64 `json:"confidence"`
+	// Contradicted: a run of consecutive matches (or a whole sample window) consistently disagrees
+	// with this mapping - e.g. a cold open or tail with its own offset that the fit absorbed.
+	Contradicted bool `json:"contradicted,omitempty"`
+	Disagreeing  int  `json:"disagreeing,omitempty"` // matches in contradicting runs/windows
+
+	agree []float64 // audio times of anchors that agree with this mapping (coverage check)
 }
 
 func (m *Mapping) PieceFor(t float64) Piece {
@@ -601,19 +607,146 @@ func placeSwitch(cues []Cue, loose []Anchor, a, b Piece, aFrom, t1, t2, bTo floa
 	return best
 }
 
+// dropExcursions removes short middle sections whose neighbours agree with each other (A-B-A).
+// A brief stretch at another offset that returns to the same timing is far more likely a biased
+// stretch of transcript than a real edit; its anchors are dropped (and then flagged as contradicting).
+func dropExcursions(segs [][]Anchor, tol float64) [][]Anchor {
+	for changed := true; changed && len(segs) > 2; {
+		changed = false
+		for i := 1; i < len(segs)-1; i++ {
+			mid := segs[i]
+			span := mid[len(mid)-1].SubTime - mid[0].SubTime
+			before := median(deltas(tail(segs[i-1], 6)))
+			after := median(deltas(segs[i+1][:min(6, len(segs[i+1]))]))
+			if math.Abs(before-after) <= tol && (len(mid) < 15 || span < 180) {
+				joined := append(append([]Anchor(nil), segs[i-1]...), segs[i+1]...)
+				segs = append(segs[:i-1], append([][]Anchor{joined}, segs[i+2:]...)...)
+				changed = true
+				break
+			}
+		}
+	}
+	return segs
+}
+
+// sections fits one piece per segment; returns nil when there is only one segment.
+func sections(inl, loose []Anchor, cues []Cue, tol float64, minSeg int) ([]Piece, []Anchor) {
+	segs := dropExcursions(mergeSegments(segment(inl, tol, minSeg), tol), tol)
+	if len(segs) < 2 {
+		return nil, nil
+	}
+	var sp []Piece
+	var su []Anchor
+	for _, sg := range segs {
+		pc, in := fitLine(sg, tol)
+		sp = append(sp, pc)
+		su = append(su, in...)
+	}
+	sp[0].Start = math.Inf(-1)
+	sp[len(sp)-1].End = math.Inf(1)
+	for i := 0; i < len(segs)-1; i++ {
+		b := placeSwitch(cues, loose, sp[i], sp[i+1], segs[i][0].SubTime,
+			segs[i][len(segs[i])-1].SubTime, segs[i+1][0].SubTime, segs[i+1][len(segs[i+1])-1].SubTime)
+		sp[i].End, sp[i+1].Start = b, b
+	}
+	return sp, su
+}
+
+// consistentRuns looks at ALL anchors (before outlier filtering, which can remove a sparse block):
+// runs of 3+ anchors in time order that disagree with the mapping in the same direction AND agree
+// with each other (spread <= 2*tol). Wild matches (> 5 s off) are skipped rather than breaking a
+// run; an anchor that agrees with the mapping ends it. Random wrong matches scatter by tens of
+// seconds, so they almost never form such a run.
+func consistentRuns(all []Anchor, m *Mapping, tol float64) int {
+	bad := 0
+	var run []float64
+	flush := func() {
+		if len(run) >= 3 {
+			bad += len(run)
+		}
+		run = run[:0]
+	}
+	for _, a := range all {
+		r := a.Delta() - m.ShiftAt(a.SubTime)
+		switch {
+		case math.Abs(r) <= tol:
+			flush()
+		case math.Abs(r) > 5:
+			// wild match: ignore
+		default:
+			if len(run) > 0 {
+				lo, hi := r, r
+				for _, x := range run {
+					lo, hi = math.Min(lo, x), math.Max(hi, x)
+				}
+				if (r > 0) != (run[0] > 0) || hi-lo > 2*tol {
+					flush()
+				}
+			}
+			run = append(run, r)
+		}
+	}
+	flush()
+	return bad
+}
+
+// contradictions counts matches that consistently disagree with the mapping: runs of 3+
+// consecutive anchors off by more than tol in the same direction, and sample windows (spans, in
+// audio time) whose anchors disagree on median.
+func contradictions(inl []Anchor, m *Mapping, spans [][2]float64, tol float64) int {
+	resid := make([]float64, len(inl))
+	for i, a := range inl {
+		resid[i] = a.Delta() - m.ShiftAt(a.SubTime)
+	}
+	bad := 0
+	for i := 0; i < len(resid); {
+		if math.Abs(resid[i]) <= tol {
+			i++
+			continue
+		}
+		j := i
+		for j < len(resid) && math.Abs(resid[j]) > tol && (resid[j] > 0) == (resid[i] > 0) {
+			j++
+		}
+		if j-i >= 3 {
+			bad += j - i
+		}
+		i = j
+	}
+	if len(spans) > 1 {
+		for _, w := range spans {
+			var r []float64
+			for i, a := range inl {
+				if a.AudioTime >= w[0] && a.AudioTime < w[1] {
+					r = append(r, resid[i])
+				}
+			}
+			if len(r) >= 2 && math.Abs(median(r)) > tol {
+				bad += len(r)
+			}
+		}
+	}
+	return bad
+}
+
 // FitMapping chooses between one line for the whole file (offset, plus drift if it is real)
-// and separate sections (when the timing genuinely jumps, e.g. a different cut). Sections must
-// each be well supported and must explain clearly more anchors than the single line.
+// and separate sections (when the timing genuinely jumps, e.g. a different cut). Both models are
+// always evaluated - a cold open or tail with its own offset is a minority a single line absorbs.
+// The chosen mapping is then checked for blocks of matches that still disagree with it.
 //
 // loose are lower-precision matches (any word, not just segment starts); they are only used to
-// decide where exactly a jump happens. May be nil.
-func FitMapping(anchors, loose []Anchor, cues []Cue, p Params) *Mapping {
-	if len(anchors) < p.MinAnchors {
+// decide where exactly a jump happens. spans are the analysed audio windows. Both may be nil.
+func FitMapping(anchors, loose []Anchor, cues []Cue, spans [][2]float64, p Params) *Mapping {
+	need := p.MinAnchors
+	if need < 3 {
+		need = 3
+	}
+	if len(anchors) < need {
 		return nil
 	}
 	tol := p.SplitTolerance
 	inl := localInliers(anchors, tol)
-	if len(inl) < p.MinAnchors {
+	if len(inl) < need {
 		return nil
 	}
 
@@ -621,43 +754,46 @@ func FitMapping(anchors, loose []Anchor, cues []Cue, p Params) *Mapping {
 	line.Start, line.End = math.Inf(-1), math.Inf(1)
 	pieces, used := []Piece{line}, lineIn
 
-	// A jump can masquerade as drift, so a sloped line always has to beat the sections model.
-	if line.Slope != 0 || float64(len(lineIn)) < 0.9*float64(len(inl)) {
-		minSeg := p.MinSegment
-		if minSeg < 8 {
-			minSeg = 8
-		}
-		segs := mergeSegments(segment(inl, tol, minSeg), tol)
-		if len(segs) > 1 {
-			var sp []Piece
-			var su []Anchor
-			for _, sg := range segs {
-				pc, in := fitLine(sg, tol)
-				sp = append(sp, pc)
-				su = append(su, in...)
-			}
-			// Sections that survive merging meet at a verified jump; they win when they explain at
-			// least as much as the single line (a small per-section cost breaks ties).
-			if len(su)-2*(len(segs)-1) >= len(lineIn) {
-				sp[0].Start = math.Inf(-1)
-				sp[len(sp)-1].End = math.Inf(1)
-				for i := 0; i < len(segs)-1; i++ {
-					b := placeSwitch(cues, loose, sp[i], sp[i+1], segs[i][0].SubTime,
-						segs[i][len(segs[i])-1].SubTime, segs[i+1][0].SubTime, segs[i+1][len(segs[i+1])-1].SubTime)
-					sp[i].End, sp[i+1].Start = b, b
-				}
-				pieces, used = sp, su
-			}
-		}
+	minSeg := p.MinSegment
+	if minSeg < 8 {
+		minSeg = 8
+	}
+	// Sections that survive merging meet at a verified jump; they win when they explain at least as
+	// much as the single line (a small per-section cost breaks ties).
+	if sp, su := sections(inl, loose, cues, tol, minSeg); sp != nil && len(su)-2*(len(sp)-1) >= len(lineIn) {
+		pieces, used = sp, su
 	}
 
-	m := &Mapping{Scale: 1, Pieces: pieces, Method: "text", AnchorsUsed: len(used)}
-	res := make([]float64, 0, len(used))
-	for _, a := range used {
-		res = append(res, math.Abs(a.Delta()-m.ShiftAt(a.SubTime)))
+	build := func(pcs []Piece, u []Anchor) *Mapping {
+		m := &Mapping{Scale: 1, Pieces: pcs, Method: "text", AnchorsUsed: len(u)}
+		res := make([]float64, 0, len(u))
+		for _, a := range u {
+			res = append(res, math.Abs(a.Delta()-m.ShiftAt(a.SubTime)))
+		}
+		m.ResidualMs = math.Round(median(res) * 1000)
+		m.Confidence = math.Round(1000*float64(m.AnchorsUsed)/float64(len(anchors))) / 1000
+		m.Disagreeing = contradictions(inl, m, spans, tol)
+		if c := consistentRuns(anchors, m, tol); c > m.Disagreeing {
+			m.Disagreeing = c
+		}
+		for _, a := range anchors {
+			if math.Abs(a.Delta()-m.ShiftAt(a.SubTime)) <= tol {
+				m.agree = append(m.agree, a.AudioTime)
+			}
+		}
+		sort.Float64s(m.agree)
+		m.Contradicted = m.Disagreeing > 0
+		return m
 	}
-	m.ResidualMs = math.Round(median(res) * 1000)
-	m.Confidence = math.Round(1000*float64(m.AnchorsUsed)/float64(len(anchors))) / 1000
+	m := build(pieces, used)
+	if m.Contradicted {
+		// a small block with its own timing may simply be too short for 8-anchor sections
+		if sp, su := sections(inl, loose, cues, tol, 4); sp != nil && len(su)-2*(len(sp)-1) >= len(lineIn) {
+			if m2 := build(sp, su); !m2.Contradicted {
+				return m2
+			}
+		}
+	}
 	return m
 }
 
@@ -725,7 +861,8 @@ func CorrelateOffset(cues []Cue, speech, spans [][2]float64, duration, maxOffset
 	var mean float64
 	for i, v := range vals {
 		mean += v
-		if v > vals[best] {
+		// ties go to the smallest shift: never move correctly timed subtitles on a coin flip
+		if v > vals[best] || (v == vals[best] && abs(i-K) < abs(best-K)) {
 			best = i
 		}
 	}
@@ -751,6 +888,36 @@ func CorrelateOffset(cues []Cue, speech, spans [][2]float64, duration, maxOffset
 	off := float64(best-K) * res
 	return &Mapping{Scale: 1, Pieces: []Piece{{Start: math.Inf(-1), End: math.Inf(1), Offset: off}},
 		Method: "activity", Confidence: math.Round(math.Min(1, sharp/3)*1000) / 1000}
+}
+
+// halves runs the activity correlation separately on the first and second half of the film.
+func halves(cues []Cue, speech, spans [][2]float64, duration, maxOffset float64) (*Mapping, *Mapping) {
+	mid := duration / 2
+	part := func(lo, hi float64) *Mapping {
+		var c []Cue
+		for _, x := range cues {
+			if x.Start >= lo && x.Start < hi {
+				c = append(c, x)
+			}
+		}
+		var sp, sn [][2]float64
+		for _, x := range speech {
+			if x[0] >= lo && x[0] < hi {
+				sp = append(sp, x)
+			}
+		}
+		for _, w := range spans {
+			a, b := math.Max(w[0], lo), math.Min(w[1], hi)
+			if b > a {
+				sn = append(sn, [2]float64{a, b})
+			}
+		}
+		if len(c) < 20 {
+			return nil
+		}
+		return CorrelateOffset(c, sp, sn, duration, maxOffset)
+	}
+	return part(0, mid), part(mid, math.Inf(1))
 }
 
 func abs(x int) int {
@@ -796,17 +963,17 @@ func decide(cues []Cue, m *Mapping, p Params, r *Result) {
 	}
 }
 
-func fitScaled(cues []Cue, words []Word, p Params, k float64) (*Mapping, int) {
+func fitScaled(cues []Cue, words []Word, spans [][2]float64, p Params, k float64) (*Mapping, int) {
 	sc := cues
 	if k != 1 {
 		sc = scaleCues(cues, k)
 	}
 	anchors := FindAnchors(sc, words, p, true)
 	loose := FindAnchors(sc, words, p, false)
-	m := FitMapping(anchors, loose, sc, p)
+	m := FitMapping(anchors, loose, sc, spans, p)
 	if m == nil { // not enough trustworthy positions: use every word (noisier, outliers get filtered)
 		anchors = loose
-		m = FitMapping(anchors, loose, sc, p)
+		m = FitMapping(anchors, loose, sc, spans, p)
 	}
 	if m != nil {
 		m.Scale = k
@@ -817,7 +984,27 @@ func fitScaled(cues []Cue, words []Word, p Params, k float64) (*Mapping, int) {
 // needsRatioSearch: try framerate rescaling only when the plain fit is missing, split up or
 // explains too few of its anchors (a big framerate mismatch looks like that).
 func needsRatioSearch(m *Mapping) bool {
-	return m == nil || len(m.Pieces) > 1 || m.Confidence < 0.6
+	return m == nil || len(m.Pieces) > 1 || m.Confidence < 0.6 || m.Contradicted
+}
+
+// cleanSample: a result from sampled windows is only trusted when the evidence is simple and
+// consistent - one offset, no drift, little disagreement - and covers the whole film: no stretch
+// longer than 20% of it (start and end included) without an agreeing match. Anything else gets a
+// full pass; sampling can't vouch for a part of the film it heard nothing useful from.
+func cleanSample(m *Mapping, duration float64) bool {
+	if len(m.Pieces) != 1 || m.Pieces[0].Slope != 0 || m.Confidence < 0.75 || m.Contradicted || len(m.agree) == 0 {
+		return false
+	}
+	if duration > 0 {
+		prev := 0.0
+		for _, t := range append(append([]float64(nil), m.agree...), duration) {
+			if t-prev > 0.2*duration {
+				return false
+			}
+			prev = t
+		}
+	}
+	return true
 }
 
 // minConfidentAnchors is the least evidence we act on, whatever MIN_ANCHORS says.
@@ -835,12 +1022,12 @@ func weak(m *Mapping, p Params) bool {
 // Analyze decides whether a subtitle track is in sync and how to fix it.
 func Analyze(cues []Cue, words []Word, speech, spans [][2]float64, duration float64, p Params, sampled bool) Result {
 	r := Result{Cues: len(cues)}
-	m, nAnchors := fitScaled(cues, words, p, 1)
+	m, nAnchors := fitScaled(cues, words, spans, p, 1)
 	if needsRatioSearch(m) && len(words) > 0 {
 		base := m
 		for _, k := range frameRatios {
-			m2, n2 := fitScaled(cues, words, p, k)
-			if m2 == nil || weak(m2, p) || m2.Confidence < 0.6 {
+			m2, n2 := fitScaled(cues, words, spans, p, k)
+			if m2 == nil || weak(m2, p) || m2.Confidence < 0.6 || m2.Contradicted {
 				continue
 			}
 			// a rescale must be clearly better than no rescale, never just different
@@ -860,16 +1047,34 @@ func Analyze(cues []Cue, words []Word, speech, spans [][2]float64, duration floa
 		r.WantsFull = sampled
 		return r
 	}
+	if m != nil && m.Contradicted {
+		r.Status = "uncertain"
+		r.Mapping = m
+		r.Message = "Timing differs between parts of the file (" + itoa(int64(m.Disagreeing)) +
+			" matched lines disagree with the best fit), left unchanged"
+		r.WantsFull = sampled
+		return r
+	}
 	if m != nil {
 		decide(cues, m, p, &r)
 		if m.Scale != 1 {
 			r.Message += " (framerate " + strconv.FormatFloat(m.Scale, 'f', 4, 64) + "x)"
 		}
-		r.WantsFull = sampled && len(m.Pieces) > 1 // sampled windows can't place cut points precisely
+		// sampled windows can miss a jump, a tail or a cold open: only a clean result stands
+		r.WantsFull = sampled && !cleanSample(m, duration)
 		return r
 	}
 	if p.AllowActivity {
 		if m := CorrelateOffset(cues, speech, spans, duration, p.MaxOffset); m != nil {
+			// one global offset only: refuse when the two halves of the film disagree
+			if a, b := halves(cues, speech, spans, duration, p.MaxOffset); a != nil && b != nil &&
+				math.Abs(a.Pieces[0].Offset-b.Pieces[0].Offset) > 0.5 {
+				r.Status = "uncertain"
+				r.Message = "Subtitle text did not match the speech, and speech activity suggests different " +
+					"offsets in each half of the film; left unchanged"
+				r.WantsFull = sampled
+				return r
+			}
 			decide(cues, m, p, &r)
 			r.Message += " (low confidence: subtitle text did not match the speech)"
 			r.WantsFull = sampled

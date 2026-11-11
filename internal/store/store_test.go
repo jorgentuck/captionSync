@@ -106,3 +106,59 @@ func TestMigrateOldDatabase(t *testing.T) {
 	}
 	s2.Close()
 }
+
+func TestFinishOnlyAppliesToProcessing(t *testing.T) {
+	s := open(t)
+	s.Enqueue("/m/a", "sig", "x", false, PriorityNow)
+	f, _ := s.ClaimNext()
+	s.Finish(f.ID, InSync, "first", "sig", nil, nil)
+	// a stale/duplicate result must not overwrite the recorded one
+	s.Finish(f.ID, Fixed, "late duplicate", "sig2", nil, nil)
+	if g, _ := s.Get(f.ID); g.Status != InSync || g.Message != "first" {
+		t.Fatalf("got %s %q", g.Status, g.Message)
+	}
+}
+
+func TestGiveUpAfterRepeatedUnfinishedAttempts(t *testing.T) {
+	s := open(t)
+	s.Enqueue("/m/crashy", "sig", "x", false, PriorityNow)
+	for i := 0; i < MaxAttempts; i++ {
+		f, _ := s.ClaimNext()
+		if f == nil {
+			t.Fatalf("attempt %d: nothing to claim", i)
+		}
+		s.ResetProcessing() // simulated crash/restart mid-job
+	}
+	if f, _ := s.ClaimNext(); f != nil {
+		t.Fatalf("claimed again after %d unfinished attempts", MaxAttempts)
+	}
+	if g, _ := s.Get(1); g.Status != Failed {
+		t.Fatalf("status %s", g.Status)
+	}
+}
+
+func TestRequeueKeepsPlaceAndEngineDownDoesNotCount(t *testing.T) {
+	s := open(t)
+	s.Enqueue("/m/a", "sig", "x", false, PriorityNow)
+	for i := 0; i < MaxAttempts+3; i++ { // engine outages never exhaust attempts
+		f, _ := s.ClaimNext()
+		if f == nil {
+			t.Fatalf("round %d: gave up on an engine outage", i)
+		}
+		s.Requeue(f.ID, "engine down", false)
+	}
+}
+
+func TestMarkMissingLeavesActiveFilesAlone(t *testing.T) {
+	s := open(t)
+	s.Enqueue("/m/a", "sig", "x", false, PriorityNow)
+	s.ClaimNext()
+	s.MarkMissing("/m/a")
+	if st := s.StatusOf("/m/a"); st != Processing {
+		t.Fatalf("status %s", st)
+	}
+	// so it can't be queued (and claimed by a second worker) while still processing
+	if r, _ := s.Enqueue("/m/a", "sig", "watcher", false, PriorityNow); r != "already" {
+		t.Fatalf("enqueue while processing: %s", r)
+	}
+}
