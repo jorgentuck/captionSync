@@ -28,9 +28,10 @@ const (
 
 // Queue priorities: higher runs first, then oldest first.
 const (
-	PriorityBulk = 0 // "process all", scheduled / startup scans
-	PriorityUser = 1 // a folder or status re-check you started
-	PriorityNow  = 2 // watcher, Bazarr/Tdarr hooks, a single file you picked
+	PriorityLater = -1 // thorough re-checks of many files: after the bulk work (they're GPU-heavy)
+	PriorityBulk  = 0  // "process all", scheduled / startup scans
+	PriorityUser  = 1  // a folder or status re-check you started
+	PriorityNow   = 2  // watcher, Bazarr/Tdarr hooks, a single file you picked
 )
 
 var terminal = map[string]bool{Fixed: true, InSync: true, NeedsFix: true, Uncertain: true, NoSubs: true, Embedded: true, Failed: true, Missing: true}
@@ -135,6 +136,12 @@ func migrate(db *sql.DB) error {
 	}
 	var ver int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		return err
+	}
+	// Thorough re-checks queued for many files at once run after the bulk work (an older version
+	// queued them ahead of it, where they hogged the GPU).
+	if _, err := db.Exec(`UPDATE files SET priority=? WHERE status=? AND priority=1 AND reason LIKE 'thorough%'`,
+		PriorityLater, Queued); err != nil {
 		return err
 	}
 	if ver < 2 {

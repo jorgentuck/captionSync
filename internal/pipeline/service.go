@@ -263,6 +263,8 @@ func (s *Service) sweep(ctx context.Context) {
 }
 
 type jobStat struct {
+	thorough         bool
+	why              []string // why sampling wasn't enough (escalation reasons)
 	done             time.Time
 	took             float64
 	listened         bool // needed the speech model (not just "no subtitles" etc.)
@@ -272,6 +274,12 @@ type jobStat struct {
 
 func (s *Service) record(started time.Time, out Outcome) {
 	st := jobStat{done: time.Now(), took: time.Since(started).Seconds()}
+	if th, _ := out.Details["thorough"].(bool); th {
+		st.thorough = true
+	}
+	if why, ok := out.Details["escalation"].([]string); ok {
+		st.why = why
+	}
 	if tm, ok := out.Details["timing"].(map[string]any); ok {
 		st.listened = true
 		st.whisperS, _ = tm["whisper_s"].(float64)
@@ -298,11 +306,15 @@ func (s *Service) Perf(queued int) map[string]any {
 	defer s.mu.Unlock()
 	var lastHour, listened, full, extra int
 	var took, whisperS, audioS float64
+	why := map[string]int{}
 	for _, j := range s.recent {
 		if time.Since(j.done) < time.Hour {
 			lastHour++
 		}
-		if j.listened {
+		for _, w := range j.why {
+			why[w]++
+		}
+		if j.listened && !j.thorough { // thorough re-checks are full passes by design
 			listened++
 			took += j.took
 			whisperS += j.whisperS
@@ -315,7 +327,7 @@ func (s *Service) Perf(queued int) map[string]any {
 			}
 		}
 	}
-	out := map[string]any{"files_last_hour": lastHour, "sample_size": listened}
+	out := map[string]any{"files_last_hour": lastHour, "sample_size": listened, "escalation_reasons": why}
 	if listened > 0 {
 		out["avg_s_per_file"] = math.Round(took / float64(listened))
 		out["full_pass_pct"] = math.Round(100 * float64(full) / float64(listened))
@@ -498,7 +510,11 @@ func (s *Service) RequeueStatus(statuses []string, reason string) (*Scan, error)
 	sc := s.newScan(fmt.Sprintf("%s: %v", reason, statuses))
 	go func() {
 		for _, p := range paths {
-			res, err := s.EnqueueFile(p, reason, true, store.PriorityUser)
+			prio := store.PriorityUser
+			if strings.HasPrefix(reason, "thorough") {
+				prio = store.PriorityLater // GPU-heavy: after the bulk work
+			}
+			res, err := s.EnqueueFile(p, reason, true, prio)
 			if err != nil {
 				slog.Warn("requeue", "path", p, "err", err)
 			}

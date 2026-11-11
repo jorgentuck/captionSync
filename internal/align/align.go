@@ -194,6 +194,8 @@ type Params struct {
 	SplitTolerance float64
 	MinSegment     int
 	AllowActivity  bool
+	// DenseSample: the sampled windows are dense enough (the extra pass) to trust a fitted drift.
+	DenseSample bool
 }
 
 func DefaultParams() Params {
@@ -214,6 +216,9 @@ type Result struct {
 	// SampleDisagrees: part of the sampled audio contradicted the result (not just thin evidence) -
 	// such a result must not stand as "in sync" without a full pass.
 	SampleDisagrees bool `json:"-"`
+	// Escalate says why a sampled result wasn't enough (WantsFull): drift, sections, contradicted,
+	// low_confidence, disagreeing_window, unheard_stretch, few_matches, no_text_match.
+	Escalate string `json:"escalate,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,12 +1040,18 @@ func needsRatioSearch(m *Mapping) bool {
 // windows with speech (about a quarter of the film) without an agreeing match. Windows without
 // speech (music, credits) don't count. disagrees reports actual contradicting evidence (as opposed
 // to merely thin evidence).
-func cleanSample(m *Mapping, words []Word, spans [][2]float64, tol float64) (clean, disagrees bool) {
-	if m.Contradicted {
-		return false, true
-	}
-	if len(m.Pieces) != 1 || m.Pieces[0].Slope != 0 || m.Confidence < 0.75 || len(m.agree) == 0 {
-		return false, false
+func cleanSample(m *Mapping, words []Word, spans [][2]float64, tol float64, allowDrift bool) (clean, disagrees bool, why string) {
+	switch {
+	case m.Contradicted:
+		return false, true, "contradicted"
+	case len(m.Pieces) != 1:
+		return false, false, "sections"
+	case m.Pieces[0].Slope != 0 && !allowDrift:
+		return false, false, "drift"
+	case m.Confidence < 0.75:
+		return false, false, "low_confidence"
+	case len(m.agree) == 0:
+		return false, false, "few_matches"
 	}
 	missed := 0
 	for _, w := range spans {
@@ -1060,17 +1071,17 @@ func cleanSample(m *Mapping, words []Word, spans [][2]float64, tol float64) (cle
 			}
 		}
 		if dis := m.disagreeIn(w); dis >= 2 && dis > agree {
-			return false, true // this part of the film contradicts the result
+			return false, true, "disagreeing_window" // this part of the film contradicts the result
 		}
 		if agree > 0 {
 			missed = 0
 			continue
 		}
 		if missed++; missed >= 3 {
-			return false, false
+			return false, false, "unheard_stretch"
 		}
 	}
-	return true, false
+	return true, false, ""
 }
 
 // minConfidentAnchors is the least evidence we act on, whatever MIN_ANCHORS says.
@@ -1110,7 +1121,7 @@ func Analyze(cues []Cue, words []Word, speech, spans [][2]float64, duration floa
 		r.Mapping = m
 		r.Message = "Not enough reliable matches to act on (" + itoa(int64(m.AnchorsUsed)) + " consistent of " +
 			itoa(int64(nAnchors)) + " matched lines), left unchanged"
-		r.WantsFull = sampled
+		r.WantsFull, r.Escalate = sampled, "few_matches"
 		return r
 	}
 	if m != nil && m.Contradicted {
@@ -1118,7 +1129,7 @@ func Analyze(cues []Cue, words []Word, speech, spans [][2]float64, duration floa
 		r.Mapping = m
 		r.Message = "Timing differs between parts of the file (" + itoa(int64(m.Disagreeing)) +
 			" matched lines disagree with the best fit), left unchanged"
-		r.WantsFull = sampled
+		r.WantsFull, r.Escalate = sampled, "contradicted"
 		return r
 	}
 	if m != nil {
@@ -1128,8 +1139,8 @@ func Analyze(cues []Cue, words []Word, speech, spans [][2]float64, duration floa
 		}
 		// sampled windows can miss a jump, a tail or a cold open: only a clean result stands
 		if sampled {
-			clean, dis := cleanSample(m, words, spans, p.SplitTolerance)
-			r.WantsFull, r.SampleDisagrees = !clean, dis
+			clean, dis, why := cleanSample(m, words, spans, p.SplitTolerance, p.DenseSample)
+			r.WantsFull, r.SampleDisagrees, r.Escalate = !clean, dis, why
 		}
 		return r
 	}
@@ -1151,6 +1162,6 @@ func Analyze(cues []Cue, words []Word, speech, spans [][2]float64, duration floa
 	}
 	r.Status, r.Reason = "uncertain", "no_match"
 	r.Message = "Could not determine timing (" + itoa(int64(nAnchors)) + " text matches)"
-	r.WantsFull = sampled
+	r.WantsFull, r.Escalate = sampled, "no_text_match"
 	return r
 }

@@ -258,15 +258,27 @@ func (p *Processor) Process(ctx context.Context, path, reason string, progress f
 	} else if err := p.listen(ctx, j, chunks(dur, p.cfg.FullChunkSec), "chunk", tr); err != nil {
 		return fail(out, err)
 	}
-	p.analyse(tracks, tr, dur, progress)
+	p.analyse(tracks, tr, dur, progress, false)
+	var escalation []string
+	note := func(pass string) {
+		for _, t := range tracks {
+			if t.err == "" && t.result.WantsFull && t.result.Escalate != "" {
+				escalation = append(escalation, pass+":"+t.result.Escalate)
+				return
+			}
+		}
+	}
 	if tr.sampled && wantsFull(tracks) && dur >= 3600 {
+		note("sample")
 		slog.Info("sampled analysis not conclusive, listening to more of the film", "path", path)
 		if err := p.listen(ctx, j, spread(dur, 3*n, w, 0.5), "extra sample", tr); err != nil {
 			return fail(out, err)
 		}
-		p.analyse(tracks, tr, dur, progress)
+		// 48 windows spread over the film pin down a straight-line drift well enough
+		p.analyse(tracks, tr, dur, progress, true)
 	}
 	if tr.sampled && wantsFull(tracks) {
+		note(map[bool]string{true: "extra", false: "sample"}[dur >= 3600])
 		why := "AUTO_FULL is off"
 		if p.cfg.AutoFull {
 			slog.Info("sampled analysis not conclusive, running full pass", "path", path)
@@ -275,7 +287,7 @@ func (p *Processor) Process(ctx context.Context, path, reason string, progress f
 			switch {
 			case err == nil:
 				tr = full
-				p.analyse(tracks, tr, dur, progress)
+				p.analyse(tracks, tr, dur, progress, false)
 			case ctx.Err() != nil || errors.Is(err, whisper.ErrEngine):
 				return fail(out, err)
 			default:
@@ -406,6 +418,9 @@ func (p *Processor) Process(ctx context.Context, path, reason string, progress f
 	out.Details["audio_delay_s"] = math.Round(delay*1000) / 1000
 	out.Details["analysis"] = map[bool]string{true: "sample", false: "full"}[tr.sampled]
 	out.Details["thorough"] = thorough
+	if len(escalation) > 0 {
+		out.Details["escalation"] = escalation
+	}
 	out.Details["timing"] = tm.summary(time.Since(started))
 	for _, t := range tracks {
 		if t.err == "" && t.result.Status == "uncertain" && t.result.Reason != "" {
@@ -535,11 +550,13 @@ func wantsFull(tracks []*track) bool {
 	return false
 }
 
-func (p *Processor) analyse(tracks []*track, tr *transcript, dur float64, progress func(string)) {
+func (p *Processor) analyse(tracks []*track, tr *transcript, dur float64, progress func(string), dense bool) {
 	progress("aligning")
+	pr := p.params()
+	pr.DenseSample = dense
 	for _, t := range tracks {
 		if t.err == "" {
-			t.result = align.Analyze(t.cues, tr.words, tr.speech, tr.spans, dur, p.params(), tr.sampled)
+			t.result = align.Analyze(t.cues, tr.words, tr.speech, tr.spans, dur, pr, tr.sampled)
 		}
 	}
 }

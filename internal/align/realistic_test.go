@@ -382,3 +382,35 @@ func TestReviewActivityFallback(t *testing.T) {
 		}
 	}
 }
+
+// With the extra pass (48 windows), a steady drift is accepted without a full pass - and must be right.
+func TestDenseSampleAcceptsDrift(t *testing.T) {
+	acc, esc := 0, 0
+	for seed := int64(1); seed <= 20; seed++ {
+		sc := &scene{cues: 1300, yield: 0.3, noise: 0.2, outliers: 0.15, seed: seed}
+		dur := 20 + 1300*5.5
+		w := windowsOf(dur)
+		for i := 0; i < 36; i++ { // the extra pass: 36 windows between the first 12
+			m := math.Min(120, dur*0.03)
+			s := m + (dur-2*m-60)*(float64(i)+0.5)/36
+			w = append(w, [2]float64{s, s + 60})
+		}
+		sc.speechOK = inWindows(w)
+		sc.subOf = func(a float64) float64 { return a + 1.0 + a*3.6/3600 }
+		cues, words := sc.build()
+		sort.Slice(cues, func(i, j int) bool { return cues[i].Start < cues[j].Start })
+		p := DefaultParams()
+		p.DenseSample = true
+		r := Analyze(cues, words, nil, w, dur, p, true)
+		if r.WantsFull {
+			esc++
+			continue
+		}
+		if r.Status == "needs_fix" && accuracy(sc, r, 0.3) >= 0.95 {
+			acc++
+		} else {
+			t.Errorf("seed %d: accepted a wrong result: %s %s", seed, r.Status, r.Message)
+		}
+	}
+	t.Logf("drift with 48 windows: %d accepted correctly, %d still escalated", acc, esc)
+}
