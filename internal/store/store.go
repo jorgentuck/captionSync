@@ -216,8 +216,13 @@ func (s *Store) Enqueue(path, signature, reason string, force bool, priority int
 // MaxAttempts: a file claimed this many times without ever finishing (crashes, restarts) is given up.
 const MaxAttempts = 5
 
-// ClaimNext atomically takes the next file: highest priority first, then oldest.
-func (s *Store) ClaimNext() (*File, error) {
+// ClaimNext atomically takes the next file: highest priority first, then oldest. With
+// skipThorough, thorough re-checks are passed over (one is already running).
+func (s *Store) ClaimNext(skipThorough ...bool) (*File, error) {
+	skip := 0
+	if len(skipThorough) > 0 && skipThorough[0] {
+		skip = 1
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for {
@@ -225,7 +230,8 @@ func (s *Store) ClaimNext() (*File, error) {
 		var path, reason string
 		var attempts int
 		err := s.db.QueryRow(`SELECT id, path, reason, attempts FROM files WHERE status=? AND queued_at <= ?
-			ORDER BY priority DESC, queued_at, id LIMIT 1`, Queued, now()).
+			AND (? = 0 OR reason NOT LIKE 'thorough%')
+			ORDER BY priority DESC, queued_at, id LIMIT 1`, Queued, now(), skip).
 			Scan(&id, &path, &reason, &attempts)
 		if err == sql.ErrNoRows {
 			return nil, nil

@@ -197,7 +197,7 @@ async function refreshStatus(){
   $("#pauseBtn").dataset.paused = s.paused;
 
   $("#current").innerHTML = s.current.length ? s.current.map(c =>
-    `<div>▶ <span class="path">${esc(c.path)}</span><br><span class="muted">${esc(c.stage)} · ${Math.round((Date.now()-new Date(c.started))/1000)}s</span></div>`).join("")
+    `<div>▶ <span class="path">${esc(c.path)}</span><br><span class="muted">${esc(c.stage)} · ${Math.round((Date.now()-new Date(c.started))/1000)}s${(c.reason||"").startsWith("thorough")?" · <b>thorough (stronger model, whole film)</b>":""}</span></div>`).join("")
     : `<span class="muted">${s.paused?"Paused.":"Idle."}${s.watcher_pending?` Watching ${s.watcher_pending} file(s) settle…`:""}</span>`;
   $("#scans").innerHTML = s.scans.slice(0,4).map(sc =>
     `<div class="muted">${sc.done?"✓":"…"} ${esc(sc.label)} — found ${sc.found}, queued ${sc.queued}, skipped ${sc.skipped}${sc.error?" · "+esc(sc.error):""}</div>`).join("");

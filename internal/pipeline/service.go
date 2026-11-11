@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,8 @@ type Service struct {
 	proc  *Processor
 
 	paused     atomic.Bool
+	thorough   atomic.Int32    // thorough re-checks running (they're slow: one at a time)
+	claimMu    sync.Mutex      // makes "claim + count thorough" one step across workers
 	engineDown atomic.Int64    // unix nanos until which workers back off (engine unavailable)
 	lastOK     atomic.Int64    // unix nanos of the last job the engine got through
 	lastOKID   atomic.Int64    // ...and which file that was
@@ -40,6 +43,7 @@ type Service struct {
 }
 
 type Current struct {
+	Reason  string    `json:"reason"`
 	ID      int64     `json:"id"`
 	Path    string    `json:"path"`
 	Stage   string    `json:"stage"`
@@ -102,7 +106,12 @@ func (s *Service) worker(ctx context.Context, id int) {
 			sleep(ctx, time.Until(until))
 			continue
 		}
-		f, err := s.store.ClaimNext()
+		s.claimMu.Lock()
+		f, err := s.store.ClaimNext(s.thorough.Load() > 0)
+		if err == nil && f != nil && strings.HasPrefix(f.Reason, "thorough") {
+			s.thorough.Add(1)
+		}
+		s.claimMu.Unlock()
 		if err != nil {
 			slog.Error("claim job", "err", err)
 			sleep(ctx, 5*time.Second)
@@ -129,7 +138,10 @@ func sleep(ctx context.Context, d time.Duration) {
 }
 
 func (s *Service) handle(ctx context.Context, wid int, f *store.File) {
-	cur := &Current{ID: f.ID, Path: f.Path, Stage: "starting", Started: time.Now()}
+	if strings.HasPrefix(f.Reason, "thorough") {
+		defer s.thorough.Add(-1) // counted when it was claimed
+	}
+	cur := &Current{ID: f.ID, Path: f.Path, Stage: "starting", Started: time.Now(), Reason: f.Reason}
 	s.mu.Lock()
 	s.current[wid] = cur
 	s.mu.Unlock()

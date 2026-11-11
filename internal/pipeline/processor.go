@@ -241,6 +241,10 @@ func (p *Processor) Process(ctx context.Context, path, reason string, progress f
 		eng = p.engine.Thorough() // stronger model, whole film
 	}
 	tm := &timing{}
+	if thorough {
+		inner := progress
+		progress = func(stage string) { inner("thorough: " + stage) }
+	}
 	j := &listenJob{path: path, audio: audio, delay: delay, engine: eng, tm: tm, progress: progress}
 	tr := &transcript{language: p.cfg.AudioLanguage}
 

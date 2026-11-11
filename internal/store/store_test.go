@@ -195,3 +195,15 @@ func TestMigrationResetsOldAttempts(t *testing.T) {
 		t.Fatalf("attempts %d after migration", g.Attempts)
 	}
 }
+
+func TestSkipThorough(t *testing.T) {
+	s := open(t)
+	s.Enqueue("/m/t1", "sig", "thorough re-check", true, PriorityUser)
+	s.Enqueue("/m/bulk", "sig", "manual all", false, PriorityBulk)
+	if f, _ := s.ClaimNext(true); f == nil || f.Path != "/m/bulk" {
+		t.Fatalf("with a thorough job running, the next worker should take bulk work, got %+v", f)
+	}
+	if f, _ := s.ClaimNext(); f == nil || f.Path != "/m/t1" {
+		t.Fatalf("got %+v", f)
+	}
+}
